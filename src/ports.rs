@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use midir::{MidiInput, MidiInputPort, MidiOutput, MidiOutputPort};
+#[cfg(target_os = "windows")]
 use tracing::{info, warn};
 
 pub fn list_ports() -> Result<Vec<String>> {
