@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA dev headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo test
+        run: cargo test --all-features --locked
+      - name: Coverage (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov --all-features --fail-under-lines 80 --lcov --output-path lcov.info
+      - name: Upload coverage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ''
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ''
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA dev headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: cargo build --release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="midi-pages-${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/midi-pages${{ matrix.ext }}" "dist/midi-pages${{ matrix.ext }}"
+          cp README.md LICENSE config.toml.example dist/
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && 7z a "../${NAME}.zip" .)
+          else
+            tar -C dist -czf "${NAME}.tar.gz" .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: midi-pages-${{ matrix.target }}
+          path: midi-pages-${{ matrix.target }}.*
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/midi-pages-*.*
+          generate_release_notes: true

@@ -1,0 +1,32 @@
+//! Device-specific behaviour (Mini MK3 vs APC mini).
+
+use crate::config::ButtonRef;
+
+/// Per-device behaviour the proxy needs in order to remain device-agnostic.
+pub trait Device: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// True if this physical note is part of the 8x8 grid we want to page.
+    /// (Top-row arrows, side buttons, and the shift/logo are *not* grid notes.)
+    fn is_grid_note(&self, note: u8) -> bool;
+
+    /// Same for CC controllers: side-strip CCs that should never be paged.
+    fn is_grid_cc(&self, controller: u8) -> bool;
+
+    /// Boot bytes (e.g. switch to programmer mode). Run once on startup.
+    fn boot(&self) -> Vec<Vec<u8>>;
+
+    /// Bytes that wipe all grid LEDs to off. Called before replaying a page.
+    fn clear_all(&self) -> Vec<Vec<u8>>;
+
+    /// Paint indicator LEDs to show `page` (1-of-N).
+    fn paint_indicators(&self, page: u8, indicators: &[ButtonRef]) -> Vec<Vec<u8>>;
+}
+
+/// Drivers known by name in config.toml.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Driver {
+    MiniMk3,
+    ApcMini,
+}
