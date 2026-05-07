@@ -1,6 +1,6 @@
 # 0003 — Note-number offset (not channel offset) for paging
 
-- **Status:** accepted
+- **Status:** superseded by [ADR 0011](0011-per-port-paging.md) as the default; still supported as an alternate mode.
 - **Date:** 2026-05-07
 
 ## Context

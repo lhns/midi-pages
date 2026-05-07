@@ -1,15 +1,28 @@
 # midi-pages example configuration.
-# Copy to config.toml and edit as needed. Run `midi-pages --list-ports` to see
-# the exact port name strings reported by your OS.
+# Copy to config.toml and edit. Run `midi-pages --list-ports` to see the exact
+# port names reported by your OS.
+#
+# Two modes:
+#
+#   mode = "per_port"   (default, recommended)
+#       The proxy creates ONE virtual port pair PER PAGE. Each page presents
+#       an identical Launchpad/APC layout to the host. No 7-bit MIDI ceiling,
+#       up to 16+ pages possible. On Windows the proxy auto-creates the
+#       loopMIDI ports it needs (loopMIDI must be installed and running).
+#       On Linux/macOS virtual ports are created natively.
+#
+#   mode = "note_offset"
+#       Single virtual port pair; pages encoded by adding `note_offset` to
+#       the note number. Fits at most ~2 pages of 64 pads (pages*note_offset
+#       must be <= 128). DasLight maps each pad on each page as a different
+#       note. Requires host_port_in / host_port_out to be set.
 
 [[device]]
 name             = "Launchpad Mini MK3"
-port_match       = "Launchpad Mini MK3"          # substring match against the OS port name
-host_port_in     = "midi-pages-host-out"          # loopMIDI port: host writes here, we read
-host_port_out    = "midi-pages-host-in"           # loopMIDI port: we write, host reads
-driver           = "mini_mk3"                     # mini_mk3 | apc_mini
+port_match       = "Launchpad Mini MK3"
+driver           = "mini_mk3"
+mode             = "per_port"
 pages            = 4
-note_offset      = 64
 # Switch the device to programmer mode on startup so SysEx LED control works.
 boot_sysex       = "F0 00 20 29 02 0D 0E 01 F7"
 # Two physical buttons reserved for paging. Mini MK3 top-row arrows are CC 91/92.
@@ -22,14 +35,30 @@ indicator_leds   = [
   { kind = "cc", number = 69 },
   { kind = "cc", number = 59 },
 ]
+# In per_port mode the proxy auto-generates port names from `name`. Override
+# with an explicit prefix if you want shorter names:
+# page_port_prefix = "lp"
+# That would create ports "lp-page1-in" / "lp-page1-out" through "lp-page4-*".
 
 [[device]]
 name             = "APC mini"
 port_match       = "APC MINI"
-host_port_in     = "midi-pages-apc-out"
-host_port_out    = "midi-pages-apc-in"
 driver           = "apc_mini"
-pages            = 4
-note_offset      = 64
+mode             = "per_port"
+pages            = 8
 page_up_button   = { kind = "note", number = 98 }
 page_down_button = { kind = "note", number = 99 }
+
+# Example of note_offset mode (capped at 2 pages with default offset of 64):
+#
+# [[device]]
+# name             = "APC mini (legacy)"
+# port_match       = "APC MINI"
+# driver           = "apc_mini"
+# mode             = "note_offset"
+# pages            = 2
+# note_offset      = 64
+# host_port_in     = "midi-pages-apc-out"
+# host_port_out    = "midi-pages-apc-in"
+# page_up_button   = { kind = "note", number = 98 }
+# page_down_button = { kind = "note", number = 99 }

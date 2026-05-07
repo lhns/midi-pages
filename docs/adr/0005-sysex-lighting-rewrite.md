@@ -1,6 +1,6 @@
 # 0005 — Rewrite SysEx Lighting messages on the fly
 
-- **Status:** accepted
+- **Status:** scoped to `note_offset` mode only after [ADR 0011](0011-per-port-paging.md). In `per_port` mode SysEx Lighting messages are forwarded byte-for-byte without rewriting.
 - **Date:** 2026-05-07
 
 ## Context

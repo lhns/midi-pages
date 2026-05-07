@@ -2,43 +2,56 @@
 
 A virtual MIDI paging proxy for the Novation **Launchpad Mini MK3** and the Akai **APC mini**, primarily intended for use with **DasLight** (and any other host that maps MIDI notes to scenes/effects).
 
-The 8x8 grid only gives you 64 buttons. `midi-pages` sits between your host software and the controller, reserves two physical buttons as **page up / page down**, and offsets the remaining 64 buttons by `page_index * 64`. From the host's point of view the controller has effectively `pages * 64` buttons.
+The 8x8 grid only gives you 64 buttons. `midi-pages` sits between your host software and the controller, reserves two physical buttons as **page up / page down**, and presents N pages of 64 pads to the host. LED state is cached per page so switching pages instantly redraws the correct LEDs without the host re-sending anything.
 
-LED state is **cached per page**, so switching pages instantly redraws the correct LEDs without the host re-sending anything. SysEx LED messages from the host are split per page on the fly.
+## Modes
 
-## Status
+There are two ways the proxy can present pages to the host. Pick one in `config.toml` per device.
 
-Early. Tested manually on a Launchpad Mini MK3 (DasLight 5) and an APC mini.
+### `mode = "per_port"` (default, recommended)
+
+The proxy creates **one virtual port pair per page**. Each page presents an identical Launchpad-shaped controller to the host. No 7-bit MIDI ceiling — you can have many pages. From DasLight's point of view they're independent controllers; you map each page exactly the way you'd map a single Launchpad. SysEx LED messages are forwarded byte-for-byte (no rewriting).
+
+On Linux/macOS the virtual ports are created natively via `midir`. On Windows, `midi-pages` shells out to `loopMIDI.exe -new "<name>"` to create them — loopMIDI must be installed and its GUI running.
+
+### `mode = "note_offset"`
+
+A single virtual port pair; pages are encoded by adding `note_offset` to the note number (default `64`). MIDI notes are 7-bit so `pages * note_offset ≤ 128` — meaning at most 2 pages of 64 pads. SysEx LED messages from the host get walked, partitioned by page, and rewritten on the fly. Useful if you specifically want a single virtual controller in DasLight.
 
 ## How it works
 
 ```
-                          loopMIDI virtual ports                real USB-MIDI
-   ┌──────────┐  ──────►  ┌─────────────────────┐  ──────►  ┌──────────────────┐
-   │ DasLight │           │     midi-pages      │           │ Launchpad / APC  │
-   └──────────┘  ◄──────  └─────────────────────┘  ◄──────  └──────────────────┘
+                         loopMIDI / native virtual ports             real USB-MIDI
+   ┌──────────┐  ──────►  ┌─────────────────────────────┐ ──────►  ┌──────────────────┐
+   │ DasLight │           │         midi-pages          │          │ Launchpad / APC  │
+   └──────────┘  ◄──────  └─────────────────────────────┘ ◄──────  └──────────────────┘
 ```
 
-Direction-by-direction:
+- **Device → host:** pad press at physical note `n` while page `p` is active is sent to page `p`'s host port (per-port mode), or rewritten as note `n + p*64` (note-offset mode). The two configured page-cycle buttons are swallowed and never reach the host.
+- **Host → device:** message arrives on page `p`'s port (or addressed to logical note in page `p` in note-offset mode). If `p` is active, forwarded to the device; otherwise cached for that page.
+- **Page change:** the device LEDs are cleared, then `led_cache[new_page]` is replayed in one batch. Held physical pads emit a Note Off on the previous page so the host sees no stuck notes.
 
-- **Device → host:** pad press at physical note `n` while page `p` is active becomes note `n + p*64`. The two configured page-cycle buttons are swallowed and never reach the host.
-- **Host → device:** Note On / Note Off / CC / Lighting-SysEx messages targeting note `m` are routed to physical pad `m % 64` only if `m / 64 == current_page`; otherwise they update an in-memory cache for that page.
-- **Page change:** the device is cleared, then `led_cache[new_page]` is replayed in one batch. Held physical pads emit a Note Off on the previous page so the host sees no stuck notes.
+## Setup
 
-## Setup (Windows)
+### Linux / macOS
 
-1. Install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html) and create two ports, e.g. `midi-pages-host-in` and `midi-pages-host-out`.
+1. Plug in your Launchpad / APC mini.
+2. Copy `config.toml.example` to `config.toml` and adjust as needed.
+3. `cargo run --release -- --config config.toml`. The proxy creates the virtual ports automatically.
+4. In DasLight, pick the per-page virtual controllers (`<device-slug>-page1`, `-page2`, ...) as MIDI inputs/outputs.
+
+### Windows
+
+1. Install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html) and **start its GUI**. Don't pre-create any ports — `midi-pages` will do it.
 2. Plug in your Launchpad / APC mini.
-3. Copy `config.toml.example` to `config.toml` and adjust port names.
-4. Run `midi-pages --list-ports` to confirm names match.
-5. Run `midi-pages --config config.toml`.
-6. In DasLight, select the loopMIDI ports as the MIDI controller (instead of the device directly).
-
-On Linux/macOS `midir` can create virtual ports natively; loopMIDI is not needed.
+3. Copy `config.toml.example` to `config.toml` and adjust as needed.
+4. `midi-pages.exe --config config.toml`. The proxy auto-creates the loopMIDI ports it needs.
+5. Run `midi-pages --list-ports` if you want to verify what got created.
+6. In DasLight, select the per-page ports as MIDI inputs/outputs.
 
 ## Configuration
 
-See `config.toml.example`. One `[[device]]` section per controller. The two reserved page-cycle buttons are configurable per device (kind = `note` or `cc`, plus number).
+See `config.toml.example`. The two reserved page-cycle buttons are configurable per device (`kind = "note" | "cc"`, plus `number`).
 
 ## Building
 
@@ -48,6 +61,10 @@ cargo test
 ```
 
 Linux requires `libasound2-dev` (ALSA headers used by `midir`).
+
+## Documentation
+
+- [Architecture Decision Records](docs/adr/) — every non-trivial choice has an ADR explaining the why.
 
 ## License
 
