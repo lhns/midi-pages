@@ -300,6 +300,7 @@ fn open_or_virtual_input<F>(
 where
     F: Fn(&[u8]) + Send + 'static,
 {
+    use midir::os::unix::VirtualInput;
     let mi = midir::MidiInput::new(client)?;
     if let Ok(port) = ports::find_input(&mi, needle) {
         return mi
@@ -335,6 +336,7 @@ where
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_or_virtual_output(client: &str, needle: &str) -> Result<midir::MidiOutputConnection> {
+    use midir::os::unix::VirtualOutput;
     let mo = midir::MidiOutput::new(client)?;
     if let Ok(port) = ports::find_output(&mo, needle) {
         return mo
