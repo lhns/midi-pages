@@ -296,32 +296,26 @@ impl Proxy {
                 channel,
                 note,
                 velocity,
-            } => {
-                if self.device.is_grid_note(note) {
-                    self.led_cache[page as usize]
-                        .insert(note, LedCell::NoteOn { channel, velocity });
-                }
+            } if self.device.is_grid_note(note) => {
+                self.led_cache[page as usize]
+                    .insert(note, LedCell::NoteOn { channel, velocity });
             }
-            Msg::NoteOff { channel, note, .. } => {
-                if self.device.is_grid_note(note) {
-                    self.led_cache[page as usize].insert(
-                        note,
-                        LedCell::NoteOn {
-                            channel,
-                            velocity: 0,
-                        },
-                    );
-                }
+            Msg::NoteOff { channel, note, .. } if self.device.is_grid_note(note) => {
+                self.led_cache[page as usize].insert(
+                    note,
+                    LedCell::NoteOn {
+                        channel,
+                        velocity: 0,
+                    },
+                );
             }
             Msg::Cc {
                 channel,
                 controller,
                 value,
-            } => {
-                if self.device.is_grid_cc(controller) {
-                    self.led_cache[page as usize]
-                        .insert(controller, LedCell::Cc { channel, value });
-                }
+            } if self.device.is_grid_cc(controller) => {
+                self.led_cache[page as usize]
+                    .insert(controller, LedCell::Cc { channel, value });
             }
             Msg::SysEx(s) if LightingSysex::looks_like(s, MINI_MK3) => {
                 if let Ok(parsed) = LightingSysex::parse(s, MINI_MK3) {
