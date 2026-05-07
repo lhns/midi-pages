@@ -33,7 +33,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo install cargo-llvm-cov --locked
-          cargo llvm-cov --all-features --fail-under-lines 80 --lcov --output-path lcov.info
+          # Exclude I/O glue (main.rs, ports.rs) — they need real MIDI hardware
+          # to exercise. The state machine, parser, and config carry the gate.
+          cargo llvm-cov \
+            --all-features \
+            --ignore-filename-regex '(main|ports)\.rs$' \
+            --fail-under-lines 80 \
+            --lcov --output-path lcov.info
       - name: Upload coverage
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
