@@ -27,6 +27,25 @@ pub enum Mode {
     NoteOffset,
 }
 
+/// Windows-only: which Windows MIDI Services transport to use for host-side
+/// virtual ports.
+///
+/// - `Loopback` (default): creates an A↔B loopback pair per logical port.
+///   Both endpoints are visible to MIDI consumers; the DAW uses the `…-in`
+///   side. This is the path that works with WinMM-based DAWs (DasLight, etc.).
+/// - `VirtualDevice`: creates ONE Virtual Device endpoint per logical port;
+///   the proxy's side is callback-only and never enumerated. Cleaner naming,
+///   but as of WMS RC4 the WinMM compatibility shim has known bugs that
+///   break common WinMM-based DAWs (microsoft/MIDI#886 and friends). Use
+///   only with DAWs you've verified work with WMS Virtual Device endpoints.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsTransport {
+    #[default]
+    Loopback,
+    VirtualDevice,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct DeviceConfig {
     pub name: String,
@@ -58,14 +77,22 @@ pub struct DeviceConfig {
     pub page_down_button: ButtonRef,
     #[serde(default)]
     pub indicator_leds: Vec<ButtonRef>,
+
+    /// Windows-only knob; ignored on Linux/macOS. See `WindowsTransport`.
+    #[serde(default)]
+    pub windows_transport: WindowsTransport,
 }
 
 impl DeviceConfig {
     /// Effective per-page port prefix (auto-derived from `name` if not set).
+    /// Kept short because Windows' WinMM MIDI device names are capped at
+    /// 31 characters (`MIDIINCAPSW.szPname[32]`), so the full
+    /// `<prefix>-page<N>-<in|out>` must fit. With the longest suffix
+    /// `-page99-out` (11 chars) the prefix can be at most 20 chars.
     pub fn effective_prefix(&self) -> String {
         self.page_port_prefix
             .clone()
-            .unwrap_or_else(|| format!("midi-pages-{}", slugify(&self.name)))
+            .unwrap_or_else(|| slugify(&self.name))
     }
 
     /// Names of the N host-side ports the proxy expects to find in `per_port` mode.
@@ -188,6 +215,23 @@ impl Config {
                             d.name
                         )));
                     }
+                    // WinMM caps MIDI device names at 31 chars (MIDIINCAPSW.szPname[32]).
+                    // Anything longer gets truncated and becomes unfindable on Windows.
+                    if let Some(longest) = d
+                        .page_port_names()
+                        .into_iter()
+                        .flat_map(|(a, b)| [a, b])
+                        .max_by_key(|s| s.len())
+                        && longest.len() > 31
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "{}: generated port name `{longest}` is {} chars; Windows truncates \
+                             MIDI device names at 31 chars. Set a shorter `page_port_prefix` \
+                             in this device section.",
+                            d.name,
+                            longest.len()
+                        )));
+                    }
                 }
             }
         }
@@ -276,8 +320,8 @@ page_down_button = { kind = "cc", number = 92 }
         assert_eq!(
             names[0],
             (
-                "midi-pages-launchpad-mini-mk3-page1-in".into(),
-                "midi-pages-launchpad-mini-mk3-page1-out".into()
+                "launchpad-mini-mk3-page1-in".into(),
+                "launchpad-mini-mk3-page1-out".into()
             )
         );
     }

@@ -17,6 +17,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 
+[target.'cfg(unix)'.dependencies]
+ctrlc = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.61"
+windows-result = "0.3"
+windows-collections = "0.2"
+windows-future = "0.2"
+
+[target.'cfg(windows)'.build-dependencies]
+windows-bindgen = "0.61"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

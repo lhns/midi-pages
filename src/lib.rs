@@ -4,3 +4,6 @@ pub mod config;
 pub mod midi;
 pub mod ports;
 pub mod proxy;
+
+#[cfg(target_os = "windows")]
+pub mod wms_bindings;

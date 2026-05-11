@@ -7,7 +7,7 @@ use midi_pages::midi::device::Driver;
 use midi_pages::midi::mini_mk3::MiniMk3;
 use midi_pages::midi::parse;
 use midi_pages::midi::sysex_lighting::{ColorSpec, LedSpec, LightingSysex, MINI_MK3};
-use midi_pages::proxy::{LedCell, Out, Proxy};
+use midi_pages::proxy::{CacheKey, LedCell, Out, Proxy};
 
 fn cfg(driver: Driver, pages: u8, mode: Mode) -> DeviceConfig {
     DeviceConfig {
@@ -38,6 +38,7 @@ fn cfg(driver: Driver, pages: u8, mode: Mode) -> DeviceConfig {
             Driver::ApcMini => ButtonRef::Note { number: 99 },
         },
         indicator_leds: vec![],
+        windows_transport: Default::default(),
     }
 }
 
@@ -57,7 +58,7 @@ fn end_to_end_paged_press_and_led_cache_offset_mode() {
     .emit();
     let out = p.handle_host_in(&bytes);
     assert!(out.iter().all(|o| !matches!(o, Out::ToDevice(_))));
-    assert!(p.led_cache[1].contains_key(&11));
+    assert!(p.led_cache[1].contains_key(&CacheKey::Note(11)));
 
     // Cycle to page 1.
     let out = p.handle_device_in(&parse::cc(0, 91, 127));
@@ -96,7 +97,7 @@ fn apc_mini_full_cycle_offset_mode() {
     assert_eq!(p.led_cache[1].len(), 64);
     for n in 0u8..64 {
         assert_eq!(
-            p.led_cache[1].get(&n),
+            p.led_cache[1].get(&CacheKey::Note(n)),
             Some(&LedCell::NoteOn {
                 channel: 0,
                 velocity: 1
@@ -127,7 +128,7 @@ fn end_to_end_per_port_mode_eight_pages() {
     }
     for page in 0u8..8 {
         assert_eq!(
-            p.led_cache[page as usize].get(&5),
+            p.led_cache[page as usize].get(&CacheKey::Note(5)),
             Some(&LedCell::NoteOn {
                 channel: 0,
                 velocity: 1 + page,

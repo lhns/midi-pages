@@ -8,12 +8,21 @@ use crate::midi::device::{Device, Driver};
 use crate::midi::parse::{self, Msg};
 use crate::midi::sysex_lighting::{ColorSpec, LedSpec, LightingSysex, MINI_MK3};
 
-/// One LED's last-known state, keyed in the cache by its physical pad index.
+/// One LED's last-known state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LedCell {
     NoteOn { channel: u8, velocity: u8 },
     Cc { channel: u8, value: u8 },
     SysexColor(ColorSpec),
+}
+
+/// Cache key — distinguishes Note-addressed buttons (grid pads) from
+/// CC-addressed buttons (Mini MK3 side column / top row), since the two
+/// number-spaces overlap (e.g. note 89 and CC 89 are different LEDs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheKey {
+    Note(u8),
+    Cc(u8),
 }
 
 /// One MIDI write the proxy wants to perform.
@@ -40,8 +49,8 @@ pub struct Proxy {
     pub indicators: Vec<ButtonRef>,
     pub driver: Driver,
 
-    /// `led_cache[page][physical_note] -> last LED state for that pad on that page`.
-    pub led_cache: Vec<HashMap<u8, LedCell>>,
+    /// `led_cache[page][CacheKey] -> last LED state for that button on that page`.
+    pub led_cache: Vec<HashMap<CacheKey, LedCell>>,
 
     /// Physical pads currently held down. Lets us synthesize Note Off on page change.
     held: HashSet<u8>,
@@ -201,7 +210,7 @@ impl Proxy {
                 let physical = controller % self.note_offset;
                 if (target_page as usize) < self.led_cache.len() {
                     self.led_cache[target_page as usize]
-                        .insert(physical, LedCell::Cc { channel, value });
+                        .insert(CacheKey::Cc(physical), LedCell::Cc { channel, value });
                 }
                 if target_page == self.current_page {
                     vec![Out::ToDevice(parse::cc(channel, physical, value).to_vec())]
@@ -231,7 +240,7 @@ impl Proxy {
             return Vec::new();
         }
         self.led_cache[target_page as usize].insert(
-            physical,
+            CacheKey::Note(physical),
             LedCell::NoteOn {
                 channel,
                 velocity: if is_on { velocity } else { 0 },
@@ -257,7 +266,7 @@ impl Proxy {
             let physical = led.led_index % self.note_offset;
             if (target_page as usize) < self.led_cache.len() {
                 self.led_cache[target_page as usize]
-                    .insert(physical, LedCell::SysexColor(led.color.clone()));
+                    .insert(CacheKey::Note(physical), LedCell::SysexColor(led.color.clone()));
             }
             if target_page == self.current_page {
                 on_page.push(LedSpec {
@@ -297,11 +306,12 @@ impl Proxy {
                 note,
                 velocity,
             } if self.device.is_grid_note(note) => {
-                self.led_cache[page as usize].insert(note, LedCell::NoteOn { channel, velocity });
+                self.led_cache[page as usize]
+                    .insert(CacheKey::Note(note), LedCell::NoteOn { channel, velocity });
             }
             Msg::NoteOff { channel, note, .. } if self.device.is_grid_note(note) => {
                 self.led_cache[page as usize].insert(
-                    note,
+                    CacheKey::Note(note),
                     LedCell::NoteOn {
                         channel,
                         velocity: 0,
@@ -312,24 +322,48 @@ impl Proxy {
                 channel,
                 controller,
                 value,
-            } if self.device.is_grid_cc(controller) => {
-                self.led_cache[page as usize].insert(controller, LedCell::Cc { channel, value });
+            } if !self.is_proxy_managed_cc(controller) => {
+                // Mini MK3 side / top-row LEDs are CC-addressed. Cache them so a
+                // page switch and return restores them. Page-cycle and indicator
+                // CCs are excluded because the proxy itself manages those —
+                // caching DAW writes to them would just be clobbered by
+                // `paint_indicators` on every page change.
+                self.led_cache[page as usize]
+                    .insert(CacheKey::Cc(controller), LedCell::Cc { channel, value });
             }
             Msg::SysEx(s) if LightingSysex::looks_like(s, MINI_MK3) => {
                 if let Ok(parsed) = LightingSysex::parse(s, MINI_MK3) {
                     for led in parsed.leds {
-                        self.led_cache[page as usize]
-                            .insert(led.led_index, LedCell::SysexColor(led.color));
+                        self.led_cache[page as usize].insert(
+                            CacheKey::Note(led.led_index),
+                            LedCell::SysexColor(led.color),
+                        );
                     }
                 }
             }
-            _ => {}
+            other => {
+                tracing::debug!(
+                    page = page,
+                    bytes = ?bytes,
+                    msg = ?other,
+                    "host-in: uncached message (forwarded once, will not replay on page return)"
+                );
+            }
         }
         if page == self.current_page {
             vec![Out::ToDevice(bytes.to_vec())]
         } else {
             Vec::new()
         }
+    }
+
+    /// True if `controller` is one of the CCs the proxy itself manages
+    /// (page-up, page-down, or any indicator LED). DAW writes to these are
+    /// fine to forward but caching them is pointless because
+    /// `paint_indicators` will overwrite them on every page change anyway.
+    fn is_proxy_managed_cc(&self, controller: u8) -> bool {
+        let cc = ButtonRef::Cc { number: controller };
+        self.page_up == cc || self.page_down == cc || self.indicators.contains(&cc)
     }
 
     // -- Page change --------------------------------------------------------
@@ -397,22 +431,24 @@ impl Proxy {
         }
         let mut out = Vec::new();
         let mut sysex_leds = Vec::new();
-        for (&physical, cell) in cache {
-            match cell {
-                LedCell::NoteOn { channel, velocity } => {
+        for (&key, cell) in cache {
+            match (key, cell) {
+                (CacheKey::Note(n), LedCell::NoteOn { channel, velocity }) => {
                     out.push(Out::ToDevice(
-                        parse::note_on(*channel, physical, *velocity).to_vec(),
+                        parse::note_on(*channel, n, *velocity).to_vec(),
                     ));
                 }
-                LedCell::Cc { channel, value } => {
-                    out.push(Out::ToDevice(
-                        parse::cc(*channel, physical, *value).to_vec(),
-                    ));
+                (CacheKey::Cc(c), LedCell::Cc { channel, value }) => {
+                    out.push(Out::ToDevice(parse::cc(*channel, c, *value).to_vec()));
                 }
-                LedCell::SysexColor(color) => sysex_leds.push(LedSpec {
-                    led_index: physical,
+                (CacheKey::Note(n), LedCell::SysexColor(color)) => sysex_leds.push(LedSpec {
+                    led_index: n,
                     color: color.clone(),
                 }),
+                // Type/key mismatches shouldn't happen — write-paths always
+                // pair Note keys with NoteOn/SysexColor and Cc keys with Cc.
+                // Skip silently rather than panicking.
+                _ => {}
             }
         }
         if !sysex_leds.is_empty() {
@@ -488,6 +524,7 @@ mod tests {
             page_up_button: ButtonRef::Cc { number: 91 },
             page_down_button: ButtonRef::Cc { number: 92 },
             indicator_leds: vec![],
+            windows_transport: Default::default(),
         }
     }
 
@@ -514,6 +551,7 @@ mod tests {
             page_up_button: ButtonRef::Note { number: 98 },
             page_down_button: ButtonRef::Note { number: 99 },
             indicator_leds: vec![],
+            windows_transport: Default::default(),
         }
     }
 
@@ -618,7 +656,7 @@ mod tests {
         let out = p.handle_host_in(&parse::note_on(0, 69, 1));
         assert!(device_bytes(&out).is_empty());
         assert_eq!(
-            p.led_cache[1].get(&5),
+            p.led_cache[1].get(&CacheKey::Note(5)),
             Some(&LedCell::NoteOn {
                 channel: 0,
                 velocity: 1
@@ -715,7 +753,7 @@ mod tests {
         let out = p.handle_host_in_per_port(1, &parse::note_on(0, 5, 3));
         assert_eq!(device_bytes(&out), vec![parse::note_on(0, 5, 3).to_vec()]);
         assert_eq!(
-            p.led_cache[1].get(&5),
+            p.led_cache[1].get(&CacheKey::Note(5)),
             Some(&LedCell::NoteOn {
                 channel: 0,
                 velocity: 3
@@ -729,8 +767,53 @@ mod tests {
         // current_page = 0; host writes on port 2.
         let out = p.handle_host_in_per_port(2, &parse::note_on(0, 5, 3));
         assert!(device_bytes(&out).is_empty());
-        assert!(p.led_cache[2].contains_key(&5));
-        assert!(!p.led_cache[0].contains_key(&5));
+        assert!(p.led_cache[2].contains_key(&CacheKey::Note(5)));
+        assert!(!p.led_cache[0].contains_key(&CacheKey::Note(5)));
+    }
+
+    #[test]
+    fn perport_host_cc_for_non_grid_button_is_cached_and_replayed() {
+        // Mini MK3 side / top-row LEDs are CC-controlled. DAW writes to a
+        // non-grid CC (e.g. CC 19) on an inactive page should be cached so
+        // returning to that page restores the LED.
+        let mut p = proxy_mini_perport(4);
+        // Page 0 active, write to page 1's port.
+        let out = p.handle_host_in_per_port(1, &parse::cc(0, 19, 42));
+        assert!(device_bytes(&out).is_empty(), "uncached on inactive page");
+        assert_eq!(
+            p.led_cache[1].get(&CacheKey::Cc(19)),
+            Some(&LedCell::Cc {
+                channel: 0,
+                value: 42,
+            })
+        );
+        // Switch to page 1 — replay must include the CC bytes.
+        let dev = device_bytes(&p.change_page_to(1));
+        assert!(
+            dev.iter().any(|b| b == &parse::cc(0, 19, 42).to_vec()),
+            "page-switch replay missing CC: {dev:02X?}"
+        );
+    }
+
+    #[test]
+    fn perport_host_cc_for_proxy_managed_button_is_not_cached() {
+        // Page-cycle and indicator CCs are managed by paint_indicators —
+        // caching DAW writes to them is pointless and would just be clobbered.
+        let mut cfg = cfg_mini(4, Mode::PerPort);
+        cfg.indicator_leds = vec![ButtonRef::Cc { number: 89 }];
+        let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
+        // page_up = CC 91 (per cfg_mini).
+        let _ = p.handle_host_in_per_port(1, &parse::cc(0, 91, 100));
+        assert!(!p.led_cache[1].contains_key(&CacheKey::Cc(91)));
+        // page_down = CC 92.
+        let _ = p.handle_host_in_per_port(1, &parse::cc(0, 92, 100));
+        assert!(!p.led_cache[1].contains_key(&CacheKey::Cc(92)));
+        // CC 89 is an indicator.
+        let _ = p.handle_host_in_per_port(1, &parse::cc(0, 89, 100));
+        assert!(!p.led_cache[1].contains_key(&CacheKey::Cc(89)));
+        // A non-managed CC IS cached.
+        let _ = p.handle_host_in_per_port(1, &parse::cc(0, 19, 100));
+        assert!(p.led_cache[1].contains_key(&CacheKey::Cc(19)));
     }
 
     #[test]
@@ -748,7 +831,7 @@ mod tests {
         let out = p.handle_host_in_per_port(1, &sysex);
         // Forwarded byte-for-byte (no rewriting in per-port mode).
         assert_eq!(device_bytes(&out), vec![sysex]);
-        assert!(p.led_cache[1].contains_key(&11));
+        assert!(p.led_cache[1].contains_key(&CacheKey::Note(11)));
     }
 
     #[test]
