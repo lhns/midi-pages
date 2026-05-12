@@ -65,223 +65,23 @@ pub fn open_output_named(client: &str, needle: &str) -> Result<midir::MidiOutput
         .map_err(|e| anyhow!("connect output `{needle}`: {e}"))
 }
 
-/// On Windows, ensure a Windows MIDI Services loopback pair exists with the
-/// given names. The endpoints are *transient* — they live until the next
-/// `midisrv` restart or PC reboot — so we re-create on every startup if
-/// needed. Skips creation if the host endpoint is already enumerable.
-/// No-op on non-Windows (Linux/macOS create virtual ports inline via midir).
-///
-/// Kept for legacy callers; new code should use the Virtual Device path —
-/// see `WindowsVirtualHostPort`.
-pub fn ensure_loopback_pair(host_name: &str, proxy_name: &str) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        windows_wms::ensure_pair(host_name, proxy_name)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (host_name, proxy_name);
-        Ok(())
-    }
-}
+#[cfg(target_os = "windows")]
+pub use windows_host::WindowsHostPort;
 
 #[cfg(target_os = "windows")]
-pub use windows_wms_virt::WindowsVirtualHostPort;
-
-
-#[cfg(target_os = "windows")]
-mod windows_wms {
-    use super::*;
-    use std::time::{Duration, Instant};
-    use tracing::{debug, info};
-    use windows_core::HSTRING;
-
-    use crate::wms_bindings::Microsoft::Windows::Devices::Midi2::Endpoints::Loopback::{
-        MidiLoopbackEndpointCreationConfig, MidiLoopbackEndpointDefinition,
-        MidiLoopbackEndpointManager,
-    };
-
-    pub(super) fn ensure_pair(host_name: &str, proxy_name: &str) -> Result<()> {
-        if port_exists(host_name)? && port_exists(proxy_name)? {
-            return Ok(());
-        }
-        info!(host = %host_name, proxy = %proxy_name, "creating WMS loopback pair");
-        ensure_wms_dll_loaded()?;
-
-        let unique_a = unique_id_for(host_name);
-        let unique_b = unique_id_for(proxy_name);
-        let association = association_id_for(host_name, proxy_name);
-
-        let def_a = MidiLoopbackEndpointDefinition {
-            Name: HSTRING::from(host_name),
-            UniqueId: HSTRING::from(unique_a.as_str()),
-            Description: HSTRING::new(),
-        };
-        let def_b = MidiLoopbackEndpointDefinition {
-            Name: HSTRING::from(proxy_name),
-            UniqueId: HSTRING::from(unique_b.as_str()),
-            Description: HSTRING::new(),
-        };
-
-        let config = MidiLoopbackEndpointCreationConfig::new()
-            .map_err(|e| anyhow!("MidiLoopbackEndpointCreationConfig::new failed: {e}. \
-                Is the Windows MIDI Services runtime installed? See \
-                https://aka.ms/MidiServicesLatestSdkRuntimeInstaller_Directx64"))?;
-        config.SetAssociationId(association)
-            .map_err(|e| anyhow!("SetAssociationId failed: {e}"))?;
-        config.SetEndpointDefinitionA(&def_a)
-            .map_err(|e| anyhow!("SetEndpointDefinitionA failed: {e}"))?;
-        config.SetEndpointDefinitionB(&def_b)
-            .map_err(|e| anyhow!("SetEndpointDefinitionB failed: {e}"))?;
-
-        let result = MidiLoopbackEndpointManager::CreateTransientLoopbackEndpoints(&config)
-            .map_err(|e| anyhow!("CreateTransientLoopbackEndpoints failed: {e}"))?;
-        let success = result
-            .Success()
-            .map_err(|e| anyhow!("read result.Success: {e}"))?;
-        if !success {
-            let info = result
-                .ErrorInformation()
-                .map(|h| h.to_string())
-                .unwrap_or_default();
-            let code = result
-                .ErrorCode()
-                .map(|c| c.0)
-                .unwrap_or(-1);
-            return Err(anyhow!(
-                "WMS loopback creation reported failure (code {code}): {info}"
-            ));
-        }
-        debug!(association = ?association, "WMS loopback creation succeeded");
-
-        wait_for_port(host_name, Duration::from_secs(3))?;
-        wait_for_port(proxy_name, Duration::from_secs(3))?;
-        Ok(())
-    }
-
-    fn port_exists(name: &str) -> Result<bool> {
-        let mi = MidiInput::new("midi-pages-probe-in")?;
-        for port in mi.ports() {
-            if mi.port_name(&port).unwrap_or_default() == name {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn wait_for_port(name: &str, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if port_exists(name)? {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "WMS loopback `{name}` was created but didn't appear in WinMM \
-                     within {:?}.",
-                    timeout
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// Stable per-name unique identifier for a loopback endpoint. WMS uses
-    /// these to distinguish persistent identities; deterministic IDs let
-    /// re-runs reuse the same logical endpoint.
-    pub(super) fn unique_id_for(name: &str) -> String {
-        format!("{:016x}", fnv1a64(name.as_bytes()))
-    }
-
-    /// Stable per-pair association GUID. Both endpoints in a pair must share
-    /// the same association ID. We derive deterministic bytes from a hash of
-    /// the pair so re-runs produce the same GUID.
-    fn association_id_for(host: &str, proxy: &str) -> windows_core::GUID {
-        let h1 = fnv1a64(host.as_bytes());
-        let h2 = fnv1a64(proxy.as_bytes());
-        let bytes = [
-            (h1 >> 56) as u8, (h1 >> 48) as u8, (h1 >> 40) as u8, (h1 >> 32) as u8,
-            (h1 >> 24) as u8, (h1 >> 16) as u8, (h1 >> 8) as u8, h1 as u8,
-            (h2 >> 56) as u8, (h2 >> 48) as u8, (h2 >> 40) as u8, (h2 >> 32) as u8,
-            (h2 >> 24) as u8, (h2 >> 16) as u8, (h2 >> 8) as u8, h2 as u8,
-        ];
-        windows_core::GUID::from_values(
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            u16::from_be_bytes([bytes[4], bytes[5]]),
-            u16::from_be_bytes([bytes[6], bytes[7]]),
-            [bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]],
-        )
-    }
-
-    /// Load `Microsoft.Windows.Devices.Midi2.dll` from the WMS install dir so
-    /// that WinRT activation can locate the loopback factory classes. The DLL
-    /// itself contains the activatable factory exports; pre-loading it makes
-    /// `RoActivateInstance` find the embedded metadata even though the class
-    /// isn't system-registered.
-    pub(super) fn ensure_wms_dll_loaded() -> Result<()> {
-        use std::sync::OnceLock;
-        static LOADED: OnceLock<Result<()>> = OnceLock::new();
-        let result: &Result<()> = LOADED.get_or_init(|| {
-            let candidates = [
-                r"C:\Program Files\Windows MIDI Services\Desktop App SDK Runtime\Microsoft.Windows.Devices.Midi2.dll",
-                r"C:\Program Files (x86)\Windows MIDI Services\Desktop App SDK Runtime\Microsoft.Windows.Devices.Midi2.dll",
-            ];
-            for c in candidates {
-                if std::path::Path::new(c).exists() {
-                    let wide: Vec<u16> = c.encode_utf16().chain(std::iter::once(0)).collect();
-                    // SAFETY: LoadLibraryW is safe to call with a valid wide string.
-                    let h = unsafe { LoadLibraryW(wide.as_ptr()) };
-                    if h.is_null() {
-                        return Err(anyhow!(
-                            "LoadLibraryW({c}) failed: {}",
-                            std::io::Error::last_os_error()
-                        ));
-                    }
-                    return Ok(());
-                }
-            }
-            Err(anyhow!(
-                "Microsoft.Windows.Devices.Midi2.dll not found. Install the \
-                 Windows MIDI Services runtime from \
-                 https://aka.ms/MidiServicesLatestSdkRuntimeInstaller_Directx64."
-            ))
-        });
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err(anyhow!("{e}")),
-        }
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
-    }
-
-    fn fnv1a64(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod windows_wms_virt {
-    //! Virtual Device-based host port: exposes ONE MIDI endpoint to the OS
-    //! and uses an in-process plugin callback for the proxy side. Replaces
-    //! the loopback A↔B pair model (which exposed both endpoints to WinMM).
+mod windows_host {
+    //! WMS Virtual Device-based host port: exposes ONE MIDI endpoint to the
+    //! OS and uses an in-process plugin callback for the proxy side.
 
     use super::*;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use tracing::info;
-    use windows_core::{HSTRING, IInspectable, Ref, GUID, implement};
+    use windows_core::{GUID, HSTRING, IInspectable, Ref, implement};
 
     use crate::midi::ump;
     use crate::wms_bindings::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual::{
-        MidiVirtualDeviceCreationConfig, MidiVirtualDeviceManager,
+        MidiVirtualDevice, MidiVirtualDeviceCreationConfig, MidiVirtualDeviceManager,
     };
     use crate::wms_bindings::Microsoft::Windows::Devices::Midi2::{
         IMidiEndpointConnectionSource, IMidiEndpointMessageProcessingPlugin,
@@ -290,43 +90,39 @@ mod windows_wms_virt {
     };
 
     /// Owned WMS Virtual Device endpoint + session + open connection + plugin.
-    /// Dropping this releases all of them and the endpoint disappears from
-    /// the system MIDI enumeration.
+    /// Dropping releases all of them and the endpoint disappears from system
+    /// MIDI enumeration.
     ///
     /// SAFETY: the wrapped WinRT class types are marked `Send + Sync` in the
-    /// generated bindings, but our wrapping struct doesn't auto-inherit those
-    /// marks because of the `Box<dyn Fn>` field. WinRT objects activated by
-    /// `RoActivateInstance` live in the MTA and are safe to call from any
-    /// thread; the COM runtime serializes per-object as needed.
-    pub struct WindowsVirtualHostPort {
-        // Order matters for Drop: connection first, then session, then device.
-        // (Actually all three are RAII-managed by the WMS service; we just
-        // hold references to keep them alive.)
+    /// generated bindings; our wrapping struct doesn't auto-inherit those
+    /// marks because of the `Box<dyn Fn>` field inside the plugin shim.
+    /// WinRT objects activated by `RoActivateInstance` live in the MTA and
+    /// are safe to call from any thread; the COM runtime serializes
+    /// per-object as needed.
+    pub struct WindowsHostPort {
         _connection: MidiEndpointConnection,
         _session: MidiSession,
-        _device: crate::wms_bindings::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual::MidiVirtualDevice,
+        _device: MidiVirtualDevice,
         _plugin: IMidiEndpointMessageProcessingPlugin,
-        // Used for sending bytes out to peers (DAW reads).
         sender: MidiEndpointConnection,
     }
 
-    unsafe impl Send for WindowsVirtualHostPort {}
-    unsafe impl Sync for WindowsVirtualHostPort {}
+    unsafe impl Send for WindowsHostPort {}
+    unsafe impl Sync for WindowsHostPort {}
 
-    impl WindowsVirtualHostPort {
-        /// Create a Virtual Device with the given external-facing name and
-        /// register `on_recv` to be called with byte-format MIDI 1.0 messages
-        /// arriving from peers.
+    impl WindowsHostPort {
+        /// Create a Virtual Device endpoint with the given external-facing
+        /// name and register `on_recv` to be called with byte-format MIDI 1.0
+        /// messages arriving from peers (the DAW).
         pub fn create<F>(name: &str, on_recv: F) -> Result<Self>
         where
             F: Fn(&[u8]) + Send + Sync + 'static,
         {
-            super::windows_wms::ensure_wms_dll_loaded()?;
+            ensure_wms_dll_loaded()?;
 
-            // Generate a stable ProductInstanceId per name so reruns of
-            // midi-pages reuse the same logical device identity.
-            let product_id =
-                format!("midi-pages.{}", super::windows_wms::unique_id_for(name));
+            // Stable per-name ProductInstanceId so reruns of midi-pages reuse
+            // the same logical device identity.
+            let product_id = format!("midi-pages.{}", unique_id_for(name));
             let info = MidiDeclaredEndpointInfo {
                 Name: HSTRING::from(name),
                 ProductInstanceId: HSTRING::from(product_id.as_str()),
@@ -352,7 +148,7 @@ mod windows_wms_virt {
             let device = MidiVirtualDeviceManager::CreateVirtualDevice(&cfg)
                 .map_err(|e| anyhow!("CreateVirtualDevice for `{name}`: {e}"))?;
             // Tell WMS to swallow MIDI 2.0 stream-config negotiation traffic;
-            // we don't speak MIDI 2.0 and don't want it in our plugin callback.
+            // we declare MIDI 1.0 only and don't want it in our callback.
             let _ = device.SetSuppressHandledMessages(true);
 
             let dev_id = device
@@ -364,9 +160,11 @@ mod windows_wms_virt {
                 .CreateEndpointConnection(&dev_id)
                 .map_err(|e| anyhow!("CreateEndpointConnection: {e}"))?;
 
-            // Build the plugin that translates UMP -> MIDI 1.0 bytes -> on_recv.
             let plugin_obj = PluginShim {
-                plugin_id: GUID::from_u128(0xb1d10001_0000_4000_8000_000000000000 ^ super::windows_wms::unique_id_for(name).parse::<u128>().unwrap_or(0)),
+                plugin_id: GUID::from_u128(
+                    0xb1d10001_0000_4000_8000_000000000000
+                        ^ u128::from(fnv1a64(name.as_bytes())),
+                ),
                 plugin_name: Mutex::new(HSTRING::from(format!("midi-pages plugin for {name}"))),
                 plugin_tag: Mutex::new(None),
                 is_enabled: Mutex::new(true),
@@ -387,9 +185,9 @@ mod windows_wms_virt {
                 ));
             }
 
-            // Wait for the externally-visible endpoint to appear in legacy
-            // enumeration so downstream `find_*` calls succeed. midisrv can
-            // be slow when multiple endpoints are created in quick succession.
+            // Wait for the externally-visible endpoint to appear in WinMM
+            // enumeration so downstream `find_*` calls would succeed; midisrv
+            // can be slow when several endpoints are created in succession.
             wait_for_port(name, Duration::from_secs(20))?;
 
             Ok(Self {
@@ -401,17 +199,16 @@ mod windows_wms_virt {
             })
         }
 
-        /// Send byte-format MIDI 1.0 message(s) to peers attached to this
-        /// virtual endpoint. The input may be one complete message; encoded
-        /// as UMP and pushed out word-by-word.
+        /// Send byte-format MIDI 1.0 message(s) to peers. The input must be
+        /// one complete message (NoteOn/Off/CC/SysEx/...); it's encoded as
+        /// UMP and pushed to the connection word-by-word (one UMP packet
+        /// per `SendSingleMessageWords*` call — for SysEx that's one MT3
+        /// packet per call).
         pub fn send(&self, bytes: &[u8]) -> Result<()> {
             let words = ump::encode(bytes, 0);
             if words.is_empty() {
                 return Ok(());
             }
-            // SendSingleMessageWords variants take 1..=4 words as ONE UMP message.
-            // Channel voice is always 1; MT3 packets are 2; we may need multiple
-            // calls (one per MT3 packet) for long SysEx.
             let mut i = 0;
             while i < words.len() {
                 let mt = (words[i] >> 28) & 0xF;
@@ -472,6 +269,61 @@ mod windows_wms_virt {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// `LoadLibraryW` `Microsoft.Windows.Devices.Midi2.dll` so that WinRT
+    /// activation can locate the Virtual Device factory classes. Unpackaged
+    /// Win32/Rust apps don't get the WinRT-registration side-by-side manifest
+    /// for free; pre-loading the DLL makes `RoActivateInstance` find the
+    /// embedded factory metadata. Cached via `OnceLock`.
+    fn ensure_wms_dll_loaded() -> Result<()> {
+        use std::sync::OnceLock;
+        static LOADED: OnceLock<Result<(), String>> = OnceLock::new();
+        let result = LOADED.get_or_init(|| {
+            let candidates = [
+                r"C:\Program Files\Windows MIDI Services\Desktop App SDK Runtime\Microsoft.Windows.Devices.Midi2.dll",
+                r"C:\Program Files (x86)\Windows MIDI Services\Desktop App SDK Runtime\Microsoft.Windows.Devices.Midi2.dll",
+            ];
+            for c in candidates {
+                if std::path::Path::new(c).exists() {
+                    let wide: Vec<u16> = c.encode_utf16().chain(std::iter::once(0)).collect();
+                    // SAFETY: LoadLibraryW with a valid wide-null-terminated string.
+                    let h = unsafe { LoadLibraryW(wide.as_ptr()) };
+                    if h.is_null() {
+                        return Err(format!(
+                            "LoadLibraryW({c}) failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+            Err(
+                "Microsoft.Windows.Devices.Midi2.dll not found. Install the Windows MIDI \
+                 Services runtime from \
+                 https://aka.ms/MidiServicesLatestSdkRuntimeInstaller_Directx64."
+                    .to_string(),
+            )
+        });
+        result.clone().map_err(|e| anyhow!("{e}"))
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+    }
+
+    fn unique_id_for(name: &str) -> String {
+        format!("{:016x}", fnv1a64(name.as_bytes()))
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
     }
 
     #[implement(IMidiEndpointMessageProcessingPlugin)]

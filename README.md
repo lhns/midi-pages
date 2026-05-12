@@ -45,16 +45,9 @@ A single virtual port pair; pages are encoded by adding `note_offset` to the not
 1. Install the [Windows MIDI Services SDK Runtime](https://aka.ms/MidiServicesLatestSdkRuntimeInstaller_Directx64) (or `winget install Microsoft.WindowsMIDIServicesSDK`). The runtime DLL must be present; the GUI tools are optional.
 2. Plug in your Launchpad / APC mini.
 3. Copy `config.toml.example` to `config.toml` and adjust as needed. On Windows the Launchpad Mini MK3 enumerates as `LPMiniMK3 MIDI` (port 1, the DAW port) and `MIDIIN2/MIDIOUT2 (LPMiniMK3 MIDI)` (port 2, the MIDI port). Programmer-mode SysEx and pad I/O go through port 2 — set `port_match = "LPMiniMK3 MIDI)"` (note the closing paren) to disambiguate.
-4. `midi-pages.exe --config config.toml`. The proxy creates two WMS Loopback endpoints per page (one `…-in` for the DAW, one `…-out` internal). See ADR 0012 for the alternative Virtual Device transport.
+4. `midi-pages.exe --config config.toml`. The proxy creates one WMS Virtual Device endpoint per page (named `<device-slug>-page<N>`) — see ADR 0012.
 5. Run `midi-pages --list-ports` if you want to verify what got created.
-6. In your DAW, select the per-page **`-in`** port as the MIDI device for both directions (input AND output). See the gotcha below.
-
-### Transport choice (Windows only)
-
-`midi-pages` supports two WMS transports for the host-side virtual ports:
-
-- **`loopback`** (default): each page creates an A↔B loopback pair. The DAW sees and binds to the `…-in` (A) endpoint; the proxy uses the `…-out` (B) endpoint internally. **Compatible with WinMM-based DAWs like DasLight 5.**
-- **`virtual-device`** (opt-in via `windows_transport = "virtual-device"` in the device's `[[device]]` section): each page creates a single WMS Virtual Device endpoint. Cleaner UX (no `…-out` companion port), but as of WMS RC4 the WinMM compatibility shim has known bugs that break common WinMM-based DAWs ([microsoft/MIDI#886](https://github.com/microsoft/MIDI/issues/886) and friends). Only use if you've verified your DAW can consume MIDI from WMS Virtual Device endpoints.
+6. In your DAW, select the per-page port as the MIDI device for both directions (input AND output). See the gotcha below.
 
 ## Configuration
 
@@ -64,7 +57,7 @@ See `config.toml.example`. The two reserved page-cycle buttons are configurable 
 
 For paging to work, the DAW must read **and write** to the per-page virtual ports — *not* directly to the physical Launchpad port. If the DAW is configured with the real Launchpad as its output, LED commands will bypass the proxy entirely; pad presses still get paged correctly via input, but switching pages and back leaves all DAW-set LEDs dark because the proxy never saw the LED writes and has nothing to replay.
 
-In DasLight specifically: in the MIDI controller editor, set both *input* and *output* to `<device-slug>-page1-in` (and the other `-pageN-in` ports for the other pages). Disable / unselect any of the real device names (`LPMiniMK3 MIDI`, `MIDIIN2 (LPMiniMK3 MIDI)`, `MIDIOUT2 (LPMiniMK3 MIDI)`).
+In DasLight specifically: in the MIDI controller editor, set both *input* and *output* to `<device-slug>-page1` (and the other `-pageN` ports for the other pages). Disable / unselect any of the real device names (`LPMiniMK3 MIDI`, `MIDIIN2 (LPMiniMK3 MIDI)`, `MIDIOUT2 (LPMiniMK3 MIDI)`).
 
 ### Always shut down the proxy gracefully (Ctrl-C, not force-kill)
 

@@ -16,8 +16,6 @@ use clap::Parser;
 use tracing::{error, info, warn};
 
 use midi_pages::config::{Config, DeviceConfig, Mode};
-#[cfg(target_os = "windows")]
-use midi_pages::config::WindowsTransport;
 use midi_pages::midi::apc_mini::ApcMini;
 use midi_pages::midi::device::{Device, Driver};
 use midi_pages::midi::mini_mk3::MiniMk3;
@@ -208,210 +206,11 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
 }
 
 // =========================================================================
-// Windows: dispatch to Loopback (DasLight-compatible) or Virtual Device
-// (cleaner UX) based on `cfg.windows_transport`.
+// Windows: WMS Virtual Device (one endpoint per page, plugin callback).
 // =========================================================================
 
 #[cfg(target_os = "windows")]
 fn run_note_offset(
-    cfg: &DeviceConfig,
-    proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
-) -> Result<()> {
-    match cfg.windows_transport {
-        WindowsTransport::Loopback => run_note_offset_loopback(cfg, proxy, device_out),
-        WindowsTransport::VirtualDevice => run_note_offset_virtual(cfg, proxy, device_out),
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn run_per_port(
-    cfg: &DeviceConfig,
-    proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
-) -> Result<()> {
-    match cfg.windows_transport {
-        WindowsTransport::Loopback => run_per_port_loopback(cfg, proxy, device_out),
-        WindowsTransport::VirtualDevice => run_per_port_virtual(cfg, proxy, device_out),
-    }
-}
-
-// ---- Windows / Loopback (default; DasLight-compatible) ------------------
-
-#[cfg(target_os = "windows")]
-fn run_note_offset_loopback(
-    cfg: &DeviceConfig,
-    proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
-) -> Result<()> {
-    let host_in_name = cfg
-        .host_port_in
-        .as_deref()
-        .ok_or_else(|| anyhow!("note_offset mode requires host_port_in"))?;
-    let host_out_name = cfg
-        .host_port_out
-        .as_deref()
-        .ok_or_else(|| anyhow!("note_offset mode requires host_port_out"))?;
-
-    // Treat (in, out) as the (host, proxy) names of a single WMS loopback pair.
-    ports::ensure_loopback_pair(host_in_name, host_out_name)?;
-
-    // Proxy uses the proxy-side endpoint (out_name) for both reading and writing;
-    // DAW talks to host-facing in_name.
-    let host_out: Arc<Mutex<midir::MidiOutputConnection>> = Arc::new(Mutex::new(
-        ports::open_output_named(&format!("midi-pages-{}-host-out", cfg.name), host_out_name)?,
-    ));
-
-    let p_dev = Arc::clone(&proxy);
-    let host_out_dev = Arc::clone(&host_out);
-    let device_out_dev = Arc::clone(&device_out);
-    let _device_in = open_device_input(
-        &format!("midi-pages-{}-device-in", cfg.name),
-        &cfg.port_match,
-        move |msg| {
-            let outs = {
-                let mut p = p_dev.lock().unwrap();
-                p.handle_device_in(msg)
-            };
-            dispatch_offset_midir(&outs, &host_out_dev, &device_out_dev);
-        },
-    )?;
-
-    let p_host = Arc::clone(&proxy);
-    let host_out_host = Arc::clone(&host_out);
-    let device_out_host = Arc::clone(&device_out);
-    let _host_in = open_device_input(
-        &format!("midi-pages-{}-host-in", cfg.name),
-        host_out_name,
-        move |msg| {
-            let outs = {
-                let mut p = p_host.lock().unwrap();
-                p.handle_host_in(msg)
-            };
-            dispatch_offset_midir(&outs, &host_out_host, &device_out_host);
-        },
-    )?;
-
-    info!(device = %cfg.name, mode = "note_offset", transport = "loopback", "running. Ctrl-C to exit.");
-    wait_for_shutdown();
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn run_per_port_loopback(
-    cfg: &DeviceConfig,
-    proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
-) -> Result<()> {
-    let pages = cfg.pages;
-    let port_names = cfg.page_port_names();
-
-    for (in_name, out_name) in &port_names {
-        ports::ensure_loopback_pair(in_name, out_name)?;
-    }
-
-    let mut host_outs: Vec<Arc<Mutex<midir::MidiOutputConnection>>> = Vec::new();
-    for (page_idx, (_, out_name)) in port_names.iter().enumerate() {
-        let conn = ports::open_output_named(
-            &format!("midi-pages-{}-page{}-out", cfg.name, page_idx + 1),
-            out_name,
-        )?;
-        host_outs.push(Arc::new(Mutex::new(conn)));
-    }
-    let host_outs = Arc::new(host_outs);
-
-    let p_dev = Arc::clone(&proxy);
-    let host_outs_dev = Arc::clone(&host_outs);
-    let device_out_dev = Arc::clone(&device_out);
-    let _device_in = open_device_input(
-        &format!("midi-pages-{}-device-in", cfg.name),
-        &cfg.port_match,
-        move |msg| {
-            let outs = {
-                let mut p = p_dev.lock().unwrap();
-                p.handle_device_in(msg)
-            };
-            dispatch_per_port_midir(&outs, &host_outs_dev, &device_out_dev);
-        },
-    )?;
-
-    let mut _host_inputs = Vec::new();
-    for (page_idx, (_, out_name)) in port_names.iter().enumerate() {
-        let p = Arc::clone(&proxy);
-        let host_outs = Arc::clone(&host_outs);
-        let device_out = Arc::clone(&device_out);
-        let page = page_idx as u8;
-        let conn = open_device_input(
-            &format!("midi-pages-{}-page{}-in", cfg.name, page_idx + 1),
-            out_name,
-            move |msg| {
-                let outs = {
-                    let mut p = p.lock().unwrap();
-                    p.handle_host_in_per_port(page, msg)
-                };
-                dispatch_per_port_midir(&outs, &host_outs, &device_out);
-            },
-        )?;
-        _host_inputs.push(conn);
-    }
-
-    info!(device = %cfg.name, mode = "per_port", transport = "loopback", pages, "running. Ctrl-C to exit.");
-    wait_for_shutdown();
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn dispatch_offset_midir(
-    outs: &[Out],
-    host_out: &Arc<Mutex<midir::MidiOutputConnection>>,
-    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
-) {
-    for o in outs {
-        match o {
-            Out::ToHost(b) => {
-                if let Err(e) = host_out.lock().unwrap().send(b) {
-                    warn!("host send: {e}");
-                }
-            }
-            Out::ToDevice(b) => {
-                if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!("device send: {e}");
-                }
-            }
-            Out::ToHostPage { .. } => warn!("got ToHostPage in note_offset mode; dropping"),
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn dispatch_per_port_midir(
-    outs: &[Out],
-    host_outs: &Arc<Vec<Arc<Mutex<midir::MidiOutputConnection>>>>,
-    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
-) {
-    for o in outs {
-        match o {
-            Out::ToHostPage { page, bytes } => {
-                if let Some(conn) = host_outs.get(*page as usize)
-                    && let Err(e) = conn.lock().unwrap().send(bytes)
-                {
-                    warn!(page = %page, "host send: {e}");
-                }
-            }
-            Out::ToDevice(b) => {
-                if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!("device send: {e}");
-                }
-            }
-            Out::ToHost(_) => warn!("got ToHost in per_port mode; dropping"),
-        }
-    }
-}
-
-// ---- Windows / Virtual Device (opt-in; one endpoint per page) ----------
-
-#[cfg(target_os = "windows")]
-fn run_note_offset_virtual(
     cfg: &DeviceConfig,
     proxy: Arc<Mutex<Proxy>>,
     device_out: Arc<Mutex<midir::MidiOutputConnection>>,
@@ -428,9 +227,9 @@ fn run_note_offset_virtual(
     // host_port.send is needed from the closure (for proxy outputs heading to
     // host). We must construct it AFTER setting up the Arc<...>, but the
     // closure also needs to call its send method — so we share it via Arc.
-    let host_port: Arc<Mutex<Option<ports::WindowsVirtualHostPort>>> = Arc::new(Mutex::new(None));
+    let host_port: Arc<Mutex<Option<ports::WindowsHostPort>>> = Arc::new(Mutex::new(None));
     let host_port_for_cb = Arc::clone(&host_port);
-    let host_port_obj = ports::WindowsVirtualHostPort::create(host_name, move |msg| {
+    let host_port_obj = ports::WindowsHostPort::create(host_name, move |msg| {
         let outs = {
             let mut p = p_host.lock().unwrap();
             p.handle_host_in(msg)
@@ -455,13 +254,13 @@ fn run_note_offset_virtual(
         },
     )?;
 
-    info!(device = %cfg.name, mode = "note_offset", transport = "virtual-device", "running. Ctrl-C to exit.");
+    info!(device = %cfg.name, mode = "note_offset", "running. Ctrl-C to exit.");
     wait_for_shutdown();
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn run_per_port_virtual(
+fn run_per_port(
     cfg: &DeviceConfig,
     proxy: Arc<Mutex<Proxy>>,
     device_out: Arc<Mutex<midir::MidiOutputConnection>>,
@@ -469,18 +268,17 @@ fn run_per_port_virtual(
     let pages = cfg.pages;
     let port_names = cfg.page_port_names();
 
-    // On Windows we use ONE Virtual Device endpoint per page. The tuple's
-    // second name ("-out") is a leftover from the loopback A↔B era and is
-    // ignored here; only the host-facing name matters.
-    let host_ports: Arc<Mutex<Vec<Option<ports::WindowsVirtualHostPort>>>> =
+    // ONE Virtual Device endpoint per page; the proxy reads via its plugin
+    // callback and writes via the same handle's `.send()`.
+    let host_ports: Arc<Mutex<Vec<Option<ports::WindowsHostPort>>>> =
         Arc::new(Mutex::new((0..pages as usize).map(|_| None).collect()));
 
-    for (page_idx, (host_name, _)) in port_names.iter().enumerate() {
+    for (page_idx, host_name) in port_names.iter().enumerate() {
         let p = Arc::clone(&proxy);
         let host_ports_for_cb = Arc::clone(&host_ports);
         let device_out_for_cb = Arc::clone(&device_out);
         let page = page_idx as u8;
-        let port = ports::WindowsVirtualHostPort::create(host_name, move |msg| {
+        let port = ports::WindowsHostPort::create(host_name, move |msg| {
             let outs = {
                 let mut p = p.lock().unwrap();
                 p.handle_host_in_per_port(page, msg)
@@ -509,7 +307,6 @@ fn run_per_port_virtual(
     info!(
         device = %cfg.name,
         mode = "per_port",
-        transport = "virtual-device",
         pages,
         "running. Ctrl-C to exit."
     );
@@ -520,7 +317,7 @@ fn run_per_port_virtual(
 #[cfg(target_os = "windows")]
 fn dispatch_offset_windows(
     outs: &[Out],
-    host_port: &Arc<Mutex<Option<ports::WindowsVirtualHostPort>>>,
+    host_port: &Arc<Mutex<Option<ports::WindowsHostPort>>>,
     device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
 ) {
     for o in outs {
@@ -547,7 +344,7 @@ fn dispatch_offset_windows(
 #[cfg(target_os = "windows")]
 fn dispatch_per_port_windows(
     outs: &[Out],
-    host_ports: &Arc<Mutex<Vec<Option<ports::WindowsVirtualHostPort>>>>,
+    host_ports: &Arc<Mutex<Vec<Option<ports::WindowsHostPort>>>>,
     device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
 ) {
     for o in outs {
@@ -588,8 +385,9 @@ where
 }
 
 // =========================================================================
-// Linux / macOS: midir's create_virtual path (unchanged).
-// Two midir virtual ports per page (`-in` / `-out`) used asymmetrically.
+// Linux / macOS: midir's `create_virtual_*` path. Each page exposes one
+// virtual port name; midir creates separate input + output sub-ports under
+// it (the DAW sees one bidirectional device).
 // =========================================================================
 
 #[cfg(not(target_os = "windows"))]
@@ -657,11 +455,14 @@ fn run_per_port(
     let pages = cfg.pages;
     let port_names = cfg.page_port_names();
 
+    // Each page exposes ONE virtual port name. midir on Unix creates separate
+    // input + output sub-ports under the same name (the DAW sees one device
+    // with both directions).
     let mut host_outs: Vec<Arc<Mutex<midir::MidiOutputConnection>>> = Vec::new();
-    for (page_idx, (_, out_name)) in port_names.iter().enumerate() {
+    for (page_idx, name) in port_names.iter().enumerate() {
         let conn = open_or_virtual_output(
             &format!("midi-pages-{}-page{}-out", cfg.name, page_idx + 1),
-            out_name,
+            name,
         )?;
         host_outs.push(Arc::new(Mutex::new(conn)));
     }
@@ -684,14 +485,14 @@ fn run_per_port(
     )?;
 
     let mut _host_inputs = Vec::new();
-    for (page_idx, (in_name, _)) in port_names.iter().enumerate() {
+    for (page_idx, name) in port_names.iter().enumerate() {
         let p = Arc::clone(&proxy);
         let host_outs = Arc::clone(&host_outs);
         let device_out = Arc::clone(&device_out);
         let page = page_idx as u8;
         let conn = open_or_virtual_input(
             &format!("midi-pages-{}-page{}-in", cfg.name, page_idx + 1),
-            in_name,
+            name,
             move |msg| {
                 let outs = {
                     let mut p = p.lock().unwrap();

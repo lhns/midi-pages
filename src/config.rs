@@ -27,25 +27,6 @@ pub enum Mode {
     NoteOffset,
 }
 
-/// Windows-only: which Windows MIDI Services transport to use for host-side
-/// virtual ports.
-///
-/// - `Loopback` (default): creates an A↔B loopback pair per logical port.
-///   Both endpoints are visible to MIDI consumers; the DAW uses the `…-in`
-///   side. This is the path that works with WinMM-based DAWs (DasLight, etc.).
-/// - `VirtualDevice`: creates ONE Virtual Device endpoint per logical port;
-///   the proxy's side is callback-only and never enumerated. Cleaner naming,
-///   but as of WMS RC4 the WinMM compatibility shim has known bugs that
-///   break common WinMM-based DAWs (microsoft/MIDI#886 and friends). Use
-///   only with DAWs you've verified work with WMS Virtual Device endpoints.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum WindowsTransport {
-    #[default]
-    Loopback,
-    VirtualDevice,
-}
-
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct DeviceConfig {
     pub name: String,
@@ -66,8 +47,8 @@ pub struct DeviceConfig {
     pub note_offset: Option<u8>,
 
     /// Used in `per_port` mode: prefix for auto-generated port names.
-    /// Defaults to a slug of `name`. The proxy will look for ports named
-    /// `<prefix>-page<N>-in` and `<prefix>-page<N>-out` for N in 1..=pages.
+    /// Defaults to a slug of `name`. The proxy creates ports named
+    /// `<prefix>-page<N>` for N in 1..=pages.
     #[serde(default)]
     pub page_port_prefix: Option<String>,
 
@@ -77,36 +58,25 @@ pub struct DeviceConfig {
     pub page_down_button: ButtonRef,
     #[serde(default)]
     pub indicator_leds: Vec<ButtonRef>,
-
-    /// Windows-only knob; ignored on Linux/macOS. See `WindowsTransport`.
-    #[serde(default)]
-    pub windows_transport: WindowsTransport,
 }
 
 impl DeviceConfig {
     /// Effective per-page port prefix (auto-derived from `name` if not set).
     /// Kept short because Windows' WinMM MIDI device names are capped at
     /// 31 characters (`MIDIINCAPSW.szPname[32]`), so the full
-    /// `<prefix>-page<N>-<in|out>` must fit. With the longest suffix
-    /// `-page99-out` (11 chars) the prefix can be at most 20 chars.
+    /// `<prefix>-page<N>` must fit. With the longest suffix `-page99` (7 chars)
+    /// the prefix can be at most 24 chars.
     pub fn effective_prefix(&self) -> String {
         self.page_port_prefix
             .clone()
             .unwrap_or_else(|| slugify(&self.name))
     }
 
-    /// Names of the N host-side ports the proxy expects to find in `per_port` mode.
-    /// Returns a `(in_name, out_name)` pair per page (loopMIDI side).
-    pub fn page_port_names(&self) -> Vec<(String, String)> {
+    /// Names of the N host-facing ports the proxy creates in `per_port` mode.
+    /// Each name is one MIDI endpoint visible to the DAW.
+    pub fn page_port_names(&self) -> Vec<String> {
         let prefix = self.effective_prefix();
-        (1..=self.pages)
-            .map(|i| {
-                (
-                    format!("{prefix}-page{i}-in"),
-                    format!("{prefix}-page{i}-out"),
-                )
-            })
-            .collect()
+        (1..=self.pages).map(|i| format!("{prefix}-page{i}")).collect()
     }
 
     pub fn note_offset_value(&self) -> u8 {
@@ -220,7 +190,6 @@ impl Config {
                     if let Some(longest) = d
                         .page_port_names()
                         .into_iter()
-                        .flat_map(|(a, b)| [a, b])
                         .max_by_key(|s| s.len())
                         && longest.len() > 31
                     {
@@ -316,14 +285,12 @@ page_down_button = { kind = "cc", number = 92 }
         assert_eq!(cfg.devices[0].pages, 4);
 
         let names = cfg.devices[0].page_port_names();
-        assert_eq!(names.len(), 4);
-        assert_eq!(
-            names[0],
-            (
-                "launchpad-mini-mk3-page1-in".into(),
-                "launchpad-mini-mk3-page1-out".into()
-            )
-        );
+        assert_eq!(names, vec![
+            "launchpad-mini-mk3-page1",
+            "launchpad-mini-mk3-page2",
+            "launchpad-mini-mk3-page3",
+            "launchpad-mini-mk3-page4",
+        ]);
     }
 
     #[test]

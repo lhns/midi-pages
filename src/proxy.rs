@@ -524,7 +524,6 @@ mod tests {
             page_up_button: ButtonRef::Cc { number: 91 },
             page_down_button: ButtonRef::Cc { number: 92 },
             indicator_leds: vec![],
-            windows_transport: Default::default(),
         }
     }
 
@@ -551,7 +550,6 @@ mod tests {
             page_up_button: ButtonRef::Note { number: 98 },
             page_down_button: ButtonRef::Note { number: 99 },
             indicator_leds: vec![],
-            windows_transport: Default::default(),
         }
     }
 

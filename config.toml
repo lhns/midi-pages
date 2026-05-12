@@ -23,7 +23,6 @@ port_match       = "LPMiniMK3 MIDI)"
 driver           = "mini_mk3"
 mode             = "per_port"
 pages            = 4
-windows_transport = "virtual-device"
 # Switch the device to programmer mode on startup so SysEx LED control works.
 boot_sysex       = "F0 00 20 29 02 0D 0E 01 F7"
 # Two physical buttons reserved for paging. Mini MK3 top-row arrows are CC 91/92.

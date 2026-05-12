@@ -38,7 +38,6 @@ fn cfg(driver: Driver, pages: u8, mode: Mode) -> DeviceConfig {
             Driver::ApcMini => ButtonRef::Note { number: 99 },
         },
         indicator_leds: vec![],
-        windows_transport: Default::default(),
     }
 }
 
