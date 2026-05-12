@@ -110,6 +110,23 @@ mod windows_host {
     unsafe impl Send for WindowsHostPort {}
     unsafe impl Sync for WindowsHostPort {}
 
+    impl Drop for WindowsHostPort {
+        fn drop(&mut self) {
+            // Explicitly tell WMS to tear down before our smart-pointer fields
+            // get released by `IUnknown::Release`. Without this the process can
+            // exit before midisrv has fully processed the reference drops,
+            // leaking the Virtual Device registration and progressively wedging
+            // the MIDI subsystem until reboot.
+            //
+            // `MidiSession::Close` closes all owned endpoint connections too,
+            // so we don't need a separate close on `_connection` / `sender`.
+            // `MidiVirtualDevice::Cleanup` is the plugin-interface teardown
+            // hook documented on the device. Errors here are best-effort.
+            let _ = self._device.Cleanup();
+            let _ = self._session.Close();
+        }
+    }
+
     impl WindowsHostPort {
         /// Create a Virtual Device endpoint with the given external-facing
         /// name and register `on_recv` to be called with byte-format MIDI 1.0

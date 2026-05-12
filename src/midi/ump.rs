@@ -122,25 +122,15 @@ impl Decoder {
             let w = words[i];
             let mt = (w >> 28) & 0xF;
             match mt {
-                0x0 | 0x1 => {
-                    // MT0 utility / MT1 system common: 1 word, single byte-stream message.
-                    let s = ((w >> 16) & 0xFF) as u8;
-                    let d1 = ((w >> 8) & 0xFF) as u8;
-                    let d2 = (w & 0xFF) as u8;
-                    let len = byte_format_len(s);
-                    let mut bytes = Vec::with_capacity(len);
-                    bytes.push(s);
-                    if len >= 2 {
-                        bytes.push(d1);
-                    }
-                    if len >= 3 {
-                        bytes.push(d2);
-                    }
-                    out.push(bytes);
+                0x0 => {
+                    // MT0 Utility: NOOP / JR Clock / JR Timestamp. No byte-format
+                    // equivalent — silently consume the word.
                     i += 1;
                 }
-                0x2 => {
-                    // MT2 MIDI 1.0 Channel Voice: 1 word, 3-byte message (or 2 for PC/CP).
+                0x1 | 0x2 => {
+                    // MT1 System Real Time / System Common, MT2 MIDI 1.0 Channel
+                    // Voice. Both 1 word, byte-format MIDI 1.0 message in
+                    // bits 16-23 (status) + 8-15 (d1) + 0-7 (d2).
                     let s = ((w >> 16) & 0xFF) as u8;
                     let d1 = ((w >> 8) & 0xFF) as u8;
                     let d2 = (w & 0xFF) as u8;
@@ -200,12 +190,18 @@ impl Decoder {
                     // MIDI-1.0-protocol endpoints; skip silently.
                     i += 2;
                 }
-                0x5 => {
-                    // MT5 extended data: 4 words. Skip.
+                0x5..=0xF => {
+                    // 128-bit packets — MT5..MT8 reserved, MT5 mixed data set,
+                    // MT9..MTC reserved, MTD Flex Data, MTE reserved, MTF UMP
+                    // Stream (endpoint/function-block discovery, stream config
+                    // negotiation, etc.). All four words. Skip them as a whole
+                    // — otherwise the trailing words are mis-read from the top
+                    // and produce phantom byte-format messages.
                     i += 4;
                 }
                 _ => {
-                    // Unknown / reserved. Skip one word to avoid infinite loop.
+                    // mt is a 4-bit field; the arms above cover 0x0..=0xF.
+                    // Defensive fallback — advance one word.
                     i += 1;
                 }
             }
@@ -306,5 +302,74 @@ mod tests {
         assert_eq!((words[0] >> 20) & 0xF, 0x0);
         let decoded = Decoder::new().feed(&words);
         assert_eq!(decoded, vec![bytes]);
+    }
+
+    // ---- MT skip table (regression for the phantom-LED bug) ---------------
+
+    /// MT0 (Utility) — NOOP / JR Clock / JR Timestamp — has no byte-format
+    /// equivalent. Decoding it must emit nothing, no matter what's in the
+    /// data bits. Previously we treated MT0 like MT1 and emitted a synthetic
+    /// 1-byte message; harmless to a Launchpad but conceptually wrong.
+    #[test]
+    fn mt0_utility_does_not_emit() {
+        // All MT0 words (top nibble = 0). Status sub-field at bits 20-23 ranges
+        // over NOOP (0), JR Clock (1), JR Timestamp (2); the rest of the bits
+        // are arbitrary timestamp/clock payload. The decoder must consume each
+        // word silently — emitting nothing.
+        let words = [
+            0x00000000_u32, // NOOP
+            0x00112233,     // NOOP with junk in data field
+            0x00100000 | 0x1234,    // JR Clock
+            0x00200000 | 0xFFFFF,   // JR Timestamp (max value)
+        ];
+        assert!(Decoder::new().feed(&words).is_empty());
+    }
+
+    /// MT 0xF (UMP Stream) is a 128-bit (4-word) packet. WMS commonly emits
+    /// Stream messages for endpoint discovery / function-block info / stream
+    /// config — interleaved with channel-voice. The decoder must consume all
+    /// 4 words atomically; if it only skips 1, the next 3 words get re-read
+    /// from the top and their bit pattern may look like a channel-voice
+    /// NoteOn — the exact phantom-LED mechanism reported by the user.
+    #[test]
+    fn mt_stream_consumes_four_words_not_one() {
+        // 4 Stream words crafted so each *individual* word's top nibble looks
+        // like a different MT (0x2 = channel voice, 0x9 = reserved 128-bit).
+        // Followed by a real MT2 NoteOn that must be the ONLY emitted message.
+        let stream = [
+            0xF0001234_u32, // word 0: MT 0xF, Format 00 (single), status, data
+            0x20904160,     // word 1 — pre-fix would have decoded this as a
+                            // channel-voice NoteOn note 0x41 vel 0x60.
+            0x29904271,     // word 2 — top nibble 0x2, status bits 0x90 etc.
+            0x00DEADBE,     // word 3 — looks like MT0 if mis-read
+        ];
+        let note_on = encode(&[0x90, 60, 100], 0);
+        let mut feed_buf = Vec::from(&stream[..]);
+        feed_buf.extend_from_slice(&note_on);
+
+        let out = Decoder::new().feed(&feed_buf);
+        assert_eq!(out, vec![vec![0x90, 60, 100]]);
+    }
+
+    /// Same coverage for MT 0xD (Flex Data). Different MT, same 4-word size,
+    /// same misread risk.
+    #[test]
+    fn mt_flex_data_consumes_four_words_not_one() {
+        let flex = [0xD0001234_u32, 0x20904160, 0x29904271, 0x00112233];
+        let note_on = encode(&[0x90, 60, 100], 0);
+        let mut buf = Vec::from(&flex[..]);
+        buf.extend_from_slice(&note_on);
+        assert_eq!(Decoder::new().feed(&buf), vec![vec![0x90, 60, 100]]);
+    }
+
+    /// MT5 (mixed data set, 4 words) was already covered in the implementation
+    /// but had no test — lock it down.
+    #[test]
+    fn mt5_consumes_four_words_not_one() {
+        let mds = [0x50001234_u32, 0x20904160, 0x29904271, 0x00112233];
+        let note_on = encode(&[0x90, 60, 100], 0);
+        let mut buf = Vec::from(&mds[..]);
+        buf.extend_from_slice(&note_on);
+        assert_eq!(Decoder::new().feed(&buf), vec![vec![0x90, 60, 100]]);
     }
 }

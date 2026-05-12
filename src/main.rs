@@ -39,6 +39,17 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Set a panic hook that flags shutdown and gives worker threads a moment
+    // to run their Drop chains (which release WMS resources). If we panic
+    // without this, the process bails before midisrv has processed our
+    // ref-drops and the Virtual Device registration leaks.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1_000));
+    }));
+
     let args = Args::parse();
 
     if args.list_ports {
@@ -126,15 +137,13 @@ fn install_shutdown_handler(threads: Vec<thread::Thread>) {
                 if let Some(threads) = THREADS.get() {
                     trigger_shutdown(threads);
                 }
-                // For CTRL_CLOSE_EVENT Windows gives us only ~5 s before it
-                // hard-terminates the process. Block here briefly so worker
-                // threads have a chance to drop their WMS resources.
-                if ctrl_type == CTRL_CLOSE_EVENT
-                    || ctrl_type == CTRL_LOGOFF_EVENT
-                    || ctrl_type == CTRL_SHUTDOWN_EVENT
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(2_500));
-                }
+                // Sleep before returning so the worker threads have time to
+                // wake from `park_timeout`, unwind, run `WindowsHostPort::Drop`
+                // (which calls `MidiSession::Close` + `MidiVirtualDevice::Cleanup`),
+                // and let `IUnknown::Release` finish before the process exits.
+                // For CTRL_CLOSE_EVENT Windows hard-terminates after ~5 s, so we
+                // can't sleep longer than that; 2.5 s is a comfortable margin.
+                std::thread::sleep(std::time::Duration::from_millis(2_500));
                 1 // TRUE = handled, don't pass to next handler
             }
             _ => 0, // not handled
