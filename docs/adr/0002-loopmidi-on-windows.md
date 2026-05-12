@@ -1,6 +1,6 @@
 # 0002 — Use loopMIDI for host-side virtual ports on Windows
 
-- **Status:** accepted
+- **Status:** superseded by ADR 0012
 - **Date:** 2026-05-07
 
 ## Context

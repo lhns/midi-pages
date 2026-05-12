@@ -5,21 +5,27 @@
 # Two modes:
 #
 #   mode = "per_port"   (default, recommended)
-#       The proxy creates ONE virtual port pair PER PAGE. Each page presents
-#       an identical Launchpad/APC layout to the host. No 7-bit MIDI ceiling,
-#       up to 16+ pages possible. On Windows the proxy auto-creates the
-#       loopMIDI ports it needs (loopMIDI must be installed and running).
-#       On Linux/macOS virtual ports are created natively.
+#       The proxy creates ONE virtual MIDI endpoint PER PAGE, named
+#       `<device-slug>-page<N>`. Each page presents an identical Launchpad/APC
+#       layout to the host. No 7-bit MIDI ceiling; up to 16+ pages possible.
+#       On Linux/macOS the endpoints are created natively via `midir`. On
+#       Windows the proxy calls the Windows MIDI Services WinRT API directly
+#       (see ADR 0012); the WMS runtime DLL must be installed.
 #
 #   mode = "note_offset"
-#       Single virtual port pair; pages encoded by adding `note_offset` to
+#       Single host port pair; pages encoded by adding `note_offset` to
 #       the note number. Fits at most ~2 pages of 64 pads (pages*note_offset
 #       must be <= 128). DasLight maps each pad on each page as a different
 #       note. Requires host_port_in / host_port_out to be set.
 
 [[device]]
 name             = "Launchpad Mini MK3"
-port_match       = "Launchpad Mini MK3"
+# On Windows the Mini MK3 enumerates as TWO ports: `LPMiniMK3 MIDI` (port 1,
+# the DAW port) and `MIDIIN2/MIDIOUT2 (LPMiniMK3 MIDI)` (port 2, the MIDI
+# port). Programmer-mode SysEx and pad I/O go through port 2 — the closing
+# paren disambiguates. On Linux/macOS the simpler `"Launchpad Mini MK3"`
+# substring works.
+port_match       = "LPMiniMK3 MIDI)"
 driver           = "mini_mk3"
 mode             = "per_port"
 pages            = 4
@@ -38,7 +44,7 @@ indicator_leds   = [
 # In per_port mode the proxy auto-generates port names from `name`. Override
 # with an explicit prefix if you want shorter names:
 # page_port_prefix = "lp"
-# That would create ports "lp-page1-in" / "lp-page1-out" through "lp-page4-*".
+# That would create ports "lp-page1" through "lp-page4".
 
 [[device]]
 name             = "APC mini"

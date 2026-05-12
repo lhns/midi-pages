@@ -20,7 +20,7 @@ Implement in **Rust 2024**, using the [`midir`](https://crates.io/crates/midir) 
 
 ### Negative
 
-- `midir` cannot create virtual MIDI ports on Windows; we depend on loopMIDI (see ADR 0002).
+- `midir` cannot create virtual MIDI ports on Windows; we call the Windows MIDI Services WinRT API directly for that (see ADR 0012).
 - Slower iteration than Node/Python during prototyping.
 
 ## Alternatives considered

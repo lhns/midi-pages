@@ -213,7 +213,7 @@ mod windows_host {
             while i < words.len() {
                 let mt = (words[i] >> 28) & 0xF;
                 let packet_words: usize = match mt {
-                    0x0 | 0x1 | 0x2 => 1,
+                    0x0..=0x2 => 1,
                     0x3 | 0x4 => 2,
                     0x5 => 4,
                     _ => 1,
@@ -326,6 +326,10 @@ mod windows_host {
         h
     }
 
+    /// Callback invoked from the plugin's `ProcessIncomingMessage` after we
+    /// decode the incoming UMP words to a MIDI 1.0 byte stream.
+    type RecvCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
+
     #[implement(IMidiEndpointMessageProcessingPlugin)]
     struct PluginShim {
         plugin_id: GUID,
@@ -333,7 +337,7 @@ mod windows_host {
         plugin_tag: Mutex<Option<IInspectable>>,
         is_enabled: Mutex<bool>,
         decoder: Mutex<ump::Decoder>,
-        callback: Box<dyn Fn(&[u8]) + Send + Sync>,
+        callback: RecvCallback,
     }
 
     impl IMidiEndpointMessageProcessingPlugin_Impl for PluginShim_Impl {

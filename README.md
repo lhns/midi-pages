@@ -10,9 +10,9 @@ There are two ways the proxy can present pages to the host. Pick one in `config.
 
 ### `mode = "per_port"` (default, recommended)
 
-The proxy creates **one virtual port pair per page**. Each page presents an identical Launchpad-shaped controller to the host. No 7-bit MIDI ceiling — you can have many pages. From DasLight's point of view they're independent controllers; you map each page exactly the way you'd map a single Launchpad. SysEx LED messages are forwarded byte-for-byte (no rewriting).
+The proxy creates **one virtual MIDI endpoint per page**, named `<device-slug>-page<N>`. Each page presents an identical Launchpad-shaped controller to the host. No 7-bit MIDI ceiling — you can have many pages. From DasLight's point of view they're independent controllers; you map each page exactly the way you'd map a single Launchpad. SysEx LED messages are forwarded byte-for-byte (no rewriting).
 
-On Linux/macOS the virtual ports are created natively via `midir`. On Windows, `midi-pages` shells out to `loopMIDI.exe -new "<name>"` to create them — loopMIDI must be installed and its GUI running.
+On Linux/macOS the virtual ports are created natively via `midir`. On Windows, `midi-pages` calls the Windows MIDI Services WinRT API (`MidiVirtualDeviceManager::CreateVirtualDevice`) directly — see ADR 0012.
 
 ### `mode = "note_offset"`
 
@@ -21,7 +21,7 @@ A single virtual port pair; pages are encoded by adding `note_offset` to the not
 ## How it works
 
 ```
-                         loopMIDI / native virtual ports             real USB-MIDI
+                       WMS Virtual Device / native virtual ports   real USB-MIDI
    ┌──────────┐  ──────►  ┌─────────────────────────────┐ ──────►  ┌──────────────────┐
    │ DasLight │           │         midi-pages          │          │ Launchpad / APC  │
    └──────────┘  ◄──────  └─────────────────────────────┘ ◄──────  └──────────────────┘
@@ -42,7 +42,7 @@ A single virtual port pair; pages are encoded by adding `note_offset` to the not
 
 ### Windows
 
-1. Install the [Windows MIDI Services SDK Runtime](https://aka.ms/MidiServicesLatestSdkRuntimeInstaller_Directx64) (or `winget install Microsoft.WindowsMIDIServicesSDK`). The runtime DLL must be present; the GUI tools are optional.
+1. Install the [Windows MIDI Services SDK Runtime](https://aka.ms/MidiServicesLatestSdkRuntimeInstaller_Directx64) (or `winget install Microsoft.WindowsMIDIServicesSDK`). The runtime DLL alone (~3 MB at `C:\Program Files\Windows MIDI Services\Desktop App SDK Runtime\Microsoft.Windows.Devices.Midi2.dll`) is sufficient to run `midi-pages`. The full WMS Tools package (~180 MB) is optional and only useful for diagnostics (`midi.exe`, `MidiSettings.exe`).
 2. Plug in your Launchpad / APC mini.
 3. Copy `config.toml.example` to `config.toml` and adjust as needed. On Windows the Launchpad Mini MK3 enumerates as `LPMiniMK3 MIDI` (port 1, the DAW port) and `MIDIIN2/MIDIOUT2 (LPMiniMK3 MIDI)` (port 2, the MIDI port). Programmer-mode SysEx and pad I/O go through port 2 — set `port_match = "LPMiniMK3 MIDI)"` (note the closing paren) to disambiguate.
 4. `midi-pages.exe --config config.toml`. The proxy creates one WMS Virtual Device endpoint per page (named `<device-slug>-page<N>`) — see ADR 0012.
@@ -71,6 +71,8 @@ cargo test
 ```
 
 Linux requires `libasound2-dev` (ALSA headers used by `midir`).
+
+Contributors building on **Windows** also need the Windows SDK installed so `build.rs` can find `Windows.winmd` under `C:\Program Files (x86)\Windows Kits\10\UnionMetadata` when generating the WMS bindings. Install via Visual Studio's *Desktop development with C++* workload, or the standalone Windows 10/11 SDK. The vendored `vendor/wms/Microsoft.Windows.Devices.Midi2.winmd` (137 KB, MIT-licensed) supplies the WMS-specific metadata; the Windows SDK supplies its `Windows.Foundation.*` dependencies.
 
 ## Documentation
 

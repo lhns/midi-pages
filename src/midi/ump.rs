@@ -15,7 +15,7 @@ pub fn encode(bytes: &[u8], group: u8) -> Vec<u32> {
     if status == 0xF0 {
         return encode_sysex(bytes, group);
     }
-    if status >= 0x80 && status < 0xF0 {
+    if (0x80..0xF0).contains(&status) {
         // Channel voice: 3 bytes (Note On/Off/CC/PolyKey/PitchBend) or 2 bytes (ProgramChange/ChannelPressure).
         let d1 = bytes.get(1).copied().unwrap_or(0);
         let d2 = bytes.get(2).copied().unwrap_or(0);

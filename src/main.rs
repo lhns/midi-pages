@@ -323,10 +323,10 @@ fn dispatch_offset_windows(
     for o in outs {
         match o {
             Out::ToHost(b) => {
-                if let Some(p) = host_port.lock().unwrap().as_ref() {
-                    if let Err(e) = p.send(b) {
-                        warn!("host send: {e}");
-                    }
+                if let Some(p) = host_port.lock().unwrap().as_ref()
+                    && let Err(e) = p.send(b)
+                {
+                    warn!("host send: {e}");
                 }
             }
             Out::ToDevice(b) => {
@@ -351,10 +351,10 @@ fn dispatch_per_port_windows(
         match o {
             Out::ToHostPage { page, bytes } => {
                 let guard = host_ports.lock().unwrap();
-                if let Some(Some(p)) = guard.get(*page as usize) {
-                    if let Err(e) = p.send(bytes) {
-                        warn!(page = %page, "host send: {e}");
-                    }
+                if let Some(Some(p)) = guard.get(*page as usize)
+                    && let Err(e) = p.send(bytes)
+                {
+                    warn!(page = %page, "host send: {e}");
                 }
             }
             Out::ToDevice(b) => {

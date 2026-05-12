@@ -20,10 +20,10 @@ Add a new `Mode::PerPort` to `DeviceConfig`, default to it, and keep `Mode::Note
 
 ## Consequences
 
-- **No 7-bit ceiling.** Any sensible `pages` count works (the proxy doesn't artificially cap; loopMIDI / OS limits dominate around 100s of ports).
+- **No 7-bit ceiling.** Any sensible `pages` count works (the proxy doesn't artificially cap; WMS / OS limits dominate around 100s of endpoints).
 - **No SysEx rewriting.** ADR 0005's parser is now used only by `note_offset` mode. The lighting SysEx parser stays in the codebase because `note_offset` users still rely on it.
 - **DasLight mapping is symmetric across pages.** Each virtual controller exposes a fresh 0–63 (or 11–88) note layout; mappings can be copy-pasted between pages.
-- More virtual port pairs to create — handled automatically (see ADR 0012).
+- More virtual endpoints to create — handled automatically (see ADR 0012).
 - Per-port mode emits a new `Out::ToHostPage { page, bytes }` variant. The dispatcher in `main.rs` routes it to the right output connection.
 
 ## Alternatives considered
