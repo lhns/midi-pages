@@ -1,7 +1,7 @@
 # 0012 — Auto-create virtual host-side ports
 
-- **Status:** accepted (revised 2026-05-12)
-- **Date:** 2026-05-08, last revised 2026-05-12
+- **Status:** accepted (revised 2026-05-13)
+- **Date:** 2026-05-08, last revised 2026-05-13
 
 ## Context
 
@@ -33,10 +33,23 @@ End users only need the **WMS Desktop App SDK Runtime** (~3 MB DLL — install v
 ### Implementation notes
 
 - Unpackaged Win32/Rust apps don't get WinRT activation registration via side-by-side manifest. We `LoadLibraryW` `Microsoft.Windows.Devices.Midi2.dll` from its install path before the first `RoActivateInstance` call; the embedded factory metadata is then discoverable. Cached via `OnceLock`.
-- Per Virtual Device we derive a deterministic `ProductInstanceId` from a hash of the host name so re-runs reuse the same logical device identity.
+- `ProductInstanceId` is `midi-pages.<fnv1a64(name)>.<process_id>` — per-process. We initially used a stable per-name id (no PID), but discovered that midisrv's WinMM bridge silently drops *recreations* of the same `(name, ProductInstanceId)` after the first cycle — `CreateVirtualDevice` succeeds server-side but the endpoint never reappears in WinMM/WMS enumeration. Including the PID makes each run a brand-new device from midisrv's view; the friendly `Name` stays stable so DAW bindings (which key on it) survive proxy restarts. Verified empirically with DasLight 5.
 - After `MidiEndpointConnection::Open()` we poll midir until the public endpoint appears in WinMM (up to 20 s; midisrv can be slow when several endpoints are created in succession).
+- Page endpoints are created **in parallel** via `std::thread::scope` — each create's wall-clock cost is dominated by midisrv's ~5 s WinMM-bridge enumeration delay; running them concurrently turns `pages × ~5 s` into roughly `max(per-port)` and a 4-page startup goes from ~25 s to ~6 s.
 - We set `MidiVirtualDevice::SetSuppressHandledMessages(true)` to swallow MIDI 2.0 stream-config negotiation traffic; we declare `SupportsMidi20Protocol = false` and only speak MIDI 1.0 bytes.
-- **Force-kill caveat**: WMS doesn't reliably clean up Virtual Device registrations when the owner process dies without dropping its `MidiVirtualDevice` references. Repeated force-kills wedge `midisrv` until reboot. We install a Win32 console-control handler in `main.rs` that catches Ctrl+C, Ctrl+Break, terminal close (X button), Logoff and Shutdown; it flips a global `SHUTDOWN` flag and unparks all worker threads so they return cleanly and `Drop` runs. **Do not** stop the proxy with Task Manager → End Task or `Stop-Process` / `taskkill /F` — Windows `TerminateProcess` runs no userland cleanup.
+
+### Cleanup / shutdown
+
+`WindowsHostPort::Drop` mirrors Microsoft's documented Virtual Device teardown ([virtual-device-app-winui sample](https://github.com/microsoft/MIDI/blob/main/samples/csharp-net/virtual-device-app-winui/MainWindow.xaml.cs)) — exactly two calls, in this order:
+
+```rust
+let _ = self._session.DisconnectEndpointConnection(self.connection_id);
+let _ = self._session.Close();
+```
+
+`MidiSession::Close` (the Rust/WinRT projection of WinRT's `IClosable::Close`, `Dispose()` in C#) cascades to plugins and other owned connections. We don't call `RemoveMessageProcessingPlugin`, `MidiVirtualDevice::Cleanup`, or `SetIsEnabled(false)`: the first is implied by `DisconnectEndpointConnection`, and the latter two are framework-side hooks (`Cleanup` is the `IMidiEndpointMessageProcessingPlugin` callback the framework invokes on plugins; `IsEnabled` is per-plugin participation, not a device kill switch). We tried each during diagnosis of an earlier wedge; only the per-PID `ProductInstanceId` fix above actually mattered.
+
+A Win32 console-control handler in `main.rs` catches Ctrl+C, Ctrl+Break, terminal close (X button), Logoff and Shutdown; it flips a global `SHUTDOWN` flag and unparks all worker threads so they return cleanly, `host_ports` Vec drops, and the per-port `Drop` runs. With the per-PID id, even a hard `taskkill /F` no longer wedges midisrv across runs (the next start uses a different id and bypasses any stale cache), but Drop is still preferred so endpoints don't accumulate as ghosts within a session.
 
 ### Compatibility footnote (DasLight 5)
 
@@ -45,7 +58,7 @@ Some old WinMM-based DAWs ([microsoft/MIDI#886](https://github.com/microsoft/MID
 ## Consequences
 
 - Linux & macOS: zero-config experience.
-- Windows: small one-time WMS runtime install. midi-pages auto-creates one Virtual Device endpoint per page on every startup; deterministic `ProductInstanceId` lets re-runs reuse the same logical identity. Startup takes ~5 s × *pages* because midisrv is slow to register endpoints in succession.
+- Windows: small one-time WMS runtime install. midi-pages auto-creates one Virtual Device endpoint per page on every startup; per-PID `ProductInstanceId` keeps midisrv's WinMM bridge from caching stale state across runs, while the stable friendly `Name` keeps DAW bindings persistent. Startup takes ~5–6 s total (parallel page creation, dominated by midisrv's WinMM enumeration latency).
 - DAW sees one MIDI port per page. The proxy's side is a callback-only handle, never enumerable — no "wrong endpoint" footgun.
 - We don't bundle the teVirtualMIDI SDK (paid licence, not redistributable for general use).
 - We vendor `Microsoft.Windows.Devices.Midi2.winmd` (137 KB, MIT-licensed) so contributors can build without WMS installed locally; the actual runtime is needed only at runtime.

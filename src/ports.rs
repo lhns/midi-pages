@@ -105,7 +105,6 @@ mod windows_host {
         _device: MidiVirtualDevice,
         _plugin: IMidiEndpointMessageProcessingPlugin,
         sender: MidiEndpointConnection,
-        plugin_id: GUID,
         connection_id: GUID,
     }
 
@@ -114,25 +113,17 @@ mod windows_host {
 
     impl Drop for WindowsHostPort {
         fn drop(&mut self) {
-            // Each step logged at info so the smoke run terminal shows
-            // exactly how far Drop got before any hang. If a call blocks
-            // midisrv, the last "step" line will be the previous step.
-            info!("Drop chain begin");
-            let _ = self._device.SetIsEnabled(false);
-            info!(step = "SetIsEnabled(false)", "Drop");
-            let _ = self
-                ._connection
-                .RemoveMessageProcessingPlugin(self.plugin_id);
-            info!(step = "RemoveMessageProcessingPlugin", "Drop");
-            let _ = self._device.Cleanup();
-            info!(step = "Cleanup", "Drop");
+            // Matches Microsoft's documented Virtual Device teardown
+            // (samples/csharp-net/virtual-device-app-winui/MainWindow.xaml.cs):
+            // disconnect the connection from the session, then close the
+            // session. `MidiSession::Close` cascades to plugins and other
+            // owned connections; the per-PID ProductInstanceId in `create`
+            // ensures recreations after this don't get blocked by midisrv's
+            // WinMM-bridge cache. Errors are ignored — best-effort in Drop.
             let _ = self
                 ._session
                 .DisconnectEndpointConnection(self.connection_id);
-            info!(step = "DisconnectEndpointConnection", "Drop");
             let _ = self._session.Close();
-            info!(step = "Session.Close", "Drop");
-            info!("Drop chain end");
         }
     }
 
@@ -236,7 +227,6 @@ mod windows_host {
                 _session: session,
                 _device: device,
                 _plugin: plugin,
-                plugin_id,
                 connection_id,
             })
         }
