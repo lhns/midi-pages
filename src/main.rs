@@ -629,90 +629,96 @@ fn run_note_offset(
     // cross-device register gate still enforces declaration order across
     // multiple devices.
     let host_port: Arc<Mutex<Option<ports::WindowsHostPort>>> = Arc::new(Mutex::new(None));
-    let pending = {
-        let _turn = await_register_turn(&register_gate, device_idx);
-        if _turn.is_none() {
-            return Ok(()); // shutdown during gate
-        }
-        let p_host = Arc::clone(&proxy);
-        let host_port_for_cb = Arc::clone(&host_port);
-        let link_for_cb = Arc::clone(&link);
-        ports::PendingHostPort::register(host_name, move |msg| {
-            let outs = {
-                let mut p = p_host.lock().unwrap();
-                p.handle_host_in(msg)
+
+    // Wrap the per-device startup + serve sequence in a closure so we can
+    // run host-port teardown unconditionally on any exit path. Without
+    // this, an early Err (e.g. wait_for_ports timeout) would skip the
+    // Drop chain and leak the partially-registered WMS endpoints into
+    // midisrv for this PID, poisoning subsequent runs.
+    let result: Result<()> = (|| {
+        let pending = {
+            let _turn = match await_register_turn(&register_gate, device_idx) {
+                Some(t) => t,
+                None => return Ok(()),
             };
-            dispatch_offset_windows(&outs, &host_port_for_cb, &link_for_cb);
-        })?
-        // _turn drops here, releasing the next device.
-    };
-    ports::wait_for_ports(&[host_name], Duration::from_secs(20))?;
-    *host_port.lock().unwrap() = Some(pending.into_ready());
-
-    // Device-side callback factory. Used both for the initial connect and
-    // by the supervisor on every reconnect. `first_seen` is shared across
-    // all callbacks the factory ever produces, so we log exactly once per
-    // device for the very first input event seen — a quick check that
-    // midir's input subscription actually fires.
-    let make_cb = {
-        let proxy = Arc::clone(&proxy);
-        let host_port = Arc::clone(&host_port);
-        let link = Arc::clone(&link);
-        let first_seen = Arc::new(AtomicBool::new(false));
-        let device_name = cfg.name.clone();
-        move || -> InputCallback {
-            let p = Arc::clone(&proxy);
-            let h = Arc::clone(&host_port);
-            let l = Arc::clone(&link);
-            let fs = Arc::clone(&first_seen);
-            let dn = device_name.clone();
-            Box::new(move |msg: &[u8]| {
-                if !fs.swap(true, Ordering::Relaxed) {
-                    info!(device = %dn, bytes = msg.len(), "first device input event");
-                }
+            let p_host = Arc::clone(&proxy);
+            let host_port_for_cb = Arc::clone(&host_port);
+            let link_for_cb = Arc::clone(&link);
+            ports::PendingHostPort::register(host_name, move |msg| {
                 let outs = {
-                    let mut p = p.lock().unwrap();
-                    p.handle_device_in(msg)
+                    let mut p = p_host.lock().unwrap();
+                    p.handle_host_in(msg)
                 };
-                dispatch_offset_windows(&outs, &h, &l);
-            })
+                dispatch_offset_windows(&outs, &host_port_for_cb, &link_for_cb);
+            })?
+            // _turn drops here, releasing the next device.
+        };
+        ports::wait_for_ports(&[host_name], Duration::from_secs(20))?;
+        *host_port.lock().unwrap() = Some(pending.into_ready());
+
+        // Device-side callback factory. Used both for the initial connect and
+        // by the supervisor on every reconnect. `first_seen` is shared across
+        // all callbacks the factory ever produces, so we log exactly once per
+        // device for the very first input event seen — a quick check that
+        // midir's input subscription actually fires.
+        let make_cb = {
+            let proxy = Arc::clone(&proxy);
+            let host_port = Arc::clone(&host_port);
+            let link = Arc::clone(&link);
+            let first_seen = Arc::new(AtomicBool::new(false));
+            let device_name = cfg.name.clone();
+            move || -> InputCallback {
+                let p = Arc::clone(&proxy);
+                let h = Arc::clone(&host_port);
+                let l = Arc::clone(&link);
+                let fs = Arc::clone(&first_seen);
+                let dn = device_name.clone();
+                Box::new(move |msg: &[u8]| {
+                    if !fs.swap(true, Ordering::Relaxed) {
+                        info!(device = %dn, bytes = msg.len(), "first device input event");
+                    }
+                    let outs = {
+                        let mut p = p.lock().unwrap();
+                        p.handle_device_in(msg)
+                    };
+                    dispatch_offset_windows(&outs, &h, &l);
+                })
+            }
+        };
+
+        // Initial connect. Soft-fail: if the physical device isn't
+        // reachable yet, let the supervisor pick up with its retry loop.
+        let cb = make_cb();
+        if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
+            warn!(
+                device = %cfg.name,
+                error = %e,
+                "physical device not reachable at startup; supervisor will keep retrying"
+            );
         }
-    };
 
-    // Initial connect. Soft-fail: if the physical device isn't reachable
-    // yet, let the supervisor pick up with its retry loop. The proxy's
-    // host-side virtual ports are already created so DasLight can bind.
-    let cb = make_cb();
-    if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
-        warn!(
-            device = %cfg.name,
-            error = %e,
-            "physical device not reachable at startup; supervisor will keep retrying"
+        spawn_supervisor(
+            cfg.name.clone(),
+            cfg.port_match.output().to_string(),
+            cfg.clone(),
+            Arc::clone(&proxy),
+            Arc::clone(&link),
+            make_cb,
         );
-    }
 
-    spawn_supervisor(
-        cfg.name.clone(),
-        cfg.port_match.output().to_string(),
-        cfg.clone(),
-        Arc::clone(&proxy),
-        Arc::clone(&link),
-        make_cb,
-    );
+        info!(device = %cfg.name, mode = "note_offset", "device ready");
+        wait_for_shutdown();
+        Ok(())
+    })();
 
-    info!(device = %cfg.name, mode = "note_offset", "device ready");
-    wait_for_shutdown();
-
-    // Force WindowsHostPort::Drop to run while this thread is still alive.
-    // The plugin shim's input-callback closure captures `Arc<host_port>`,
-    // forming a reference cycle that keeps the WindowsHostPort alive past
-    // process exit — Drop never fires, midisrv keeps the Virtual Device
-    // registration for this dead PID, and the next run hangs on
-    // CreateVirtualDevice. Taking the Option here releases the value (and
-    // therefore the WMS resources) synchronously.
+    // Force WindowsHostPort::Drop unconditionally — same teardown the
+    // success path needs (Arc-cycle through the plugin shim's input
+    // callback keeps the value alive otherwise) and the error path
+    // needs (otherwise partially-registered endpoints leak into midisrv
+    // and break subsequent runs).
     let _dropped = host_port.lock().unwrap().take();
     settle_midisrv(&cfg.name, &[host_name]);
-    Ok(())
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -730,116 +736,121 @@ fn run_per_port(
     // callback and writes via the same handle's `.send()`.
     let host_ports: Arc<Mutex<Vec<Option<ports::WindowsHostPort>>>> =
         Arc::new(Mutex::new((0..pages as usize).map(|_| None).collect()));
-
-    // Two-phase creation. Phase 1 registers all per-page endpoints
-    // serially in page order on this thread — fast (~tens of ms each) and
-    // gives midisrv the CreateVirtualDevice calls back-to-back so the WinMM
-    // device-index assignments come out in page order (DasLight persists
-    // its MIDI bindings by index, so this stability matters across runs).
-    // The cross-device register gate ensures multiple [[device]] entries
-    // also register in declaration order, so WinMM indices stay stable
-    // across the full configured fleet. Phase 2 (the slow visibility wait
-    // and everything downstream) runs in parallel across devices.
-    let pending: Vec<(usize, ports::PendingHostPort)> = {
-        let _turn = match await_register_turn(&register_gate, device_idx) {
-            Some(t) => t,
-            None => return Ok(()), // shutdown while waiting
-        };
-        let mut pending = Vec::with_capacity(port_names.len());
-        for (page_idx, host_name) in port_names.iter().enumerate() {
-            let p = Arc::clone(&proxy);
-            let host_ports_for_cb = Arc::clone(&host_ports);
-            let link_for_cb = Arc::clone(&link);
-            let page = page_idx as u8;
-            let pending_port = ports::PendingHostPort::register(host_name, move |msg| {
-                let outs = {
-                    let mut p = p.lock().unwrap();
-                    p.handle_host_in_per_port(page, msg)
-                };
-                dispatch_per_port_windows(&outs, &host_ports_for_cb, &link_for_cb);
-            })?;
-            pending.push((page_idx, pending_port));
-        }
-        pending
-        // _turn drops here, releasing the next device's registration.
-    };
-
     let name_refs: Vec<&str> = port_names.iter().map(String::as_str).collect();
-    ports::wait_for_ports(&name_refs, Duration::from_secs(20))?;
 
-    {
-        let mut guard = host_ports.lock().unwrap();
-        for (page_idx, pending_port) in pending {
-            guard[page_idx] = Some(pending_port.into_ready());
+    // Wrap the startup + serve sequence in a closure so the host-port
+    // teardown runs unconditionally on any exit path. Without this, an
+    // early Err (e.g. wait_for_ports timing out under midisrv load)
+    // would leak the partially-registered WMS endpoints into midisrv
+    // for this PID and poison subsequent runs.
+    let result: Result<()> = (|| {
+        // Two-phase creation. Phase 1 registers all per-page endpoints
+        // serially in page order on this thread — fast (~tens of ms each)
+        // and gives midisrv the CreateVirtualDevice calls back-to-back
+        // so the WinMM device-index assignments come out in page order
+        // (DasLight persists its MIDI bindings by index, so this
+        // stability matters across runs). The cross-device register gate
+        // ensures multiple [[device]] entries also register in
+        // declaration order. Phase 2 (the slow visibility wait and
+        // everything downstream) runs in parallel across devices.
+        let pending: Vec<(usize, ports::PendingHostPort)> = {
+            let _turn = match await_register_turn(&register_gate, device_idx) {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            let mut pending = Vec::with_capacity(port_names.len());
+            for (page_idx, host_name) in port_names.iter().enumerate() {
+                let p = Arc::clone(&proxy);
+                let host_ports_for_cb = Arc::clone(&host_ports);
+                let link_for_cb = Arc::clone(&link);
+                let page = page_idx as u8;
+                let pending_port = ports::PendingHostPort::register(host_name, move |msg| {
+                    let outs = {
+                        let mut p = p.lock().unwrap();
+                        p.handle_host_in_per_port(page, msg)
+                    };
+                    dispatch_per_port_windows(&outs, &host_ports_for_cb, &link_for_cb);
+                })?;
+                pending.push((page_idx, pending_port));
+            }
+            pending
+        };
+
+        ports::wait_for_ports(&name_refs, Duration::from_secs(20))?;
+
+        {
+            let mut guard = host_ports.lock().unwrap();
+            for (page_idx, pending_port) in pending {
+                guard[page_idx] = Some(pending_port.into_ready());
+            }
         }
-    }
 
-    // Device-side callback factory; rebuilt each reconnect by the supervisor.
-    // `first_seen` is shared across all callbacks the factory produces so the
-    // first input event per device logs exactly once (a quick sanity check
-    // that midir's input subscription actually fires).
-    let make_cb = {
-        let proxy = Arc::clone(&proxy);
-        let host_ports = Arc::clone(&host_ports);
-        let link = Arc::clone(&link);
-        let first_seen = Arc::new(AtomicBool::new(false));
-        let device_name = cfg.name.clone();
-        move || -> InputCallback {
-            let p = Arc::clone(&proxy);
-            let h = Arc::clone(&host_ports);
-            let l = Arc::clone(&link);
-            let fs = Arc::clone(&first_seen);
-            let dn = device_name.clone();
-            Box::new(move |msg: &[u8]| {
-                if !fs.swap(true, Ordering::Relaxed) {
-                    info!(device = %dn, bytes = msg.len(), "first device input event");
-                }
-                let outs = {
-                    let mut p = p.lock().unwrap();
-                    p.handle_device_in(msg)
-                };
-                dispatch_per_port_windows(&outs, &h, &l);
-            })
+        // Device-side callback factory; rebuilt each reconnect by the
+        // supervisor. `first_seen` is shared across all callbacks the
+        // factory produces so the first input event per device logs once.
+        let make_cb = {
+            let proxy = Arc::clone(&proxy);
+            let host_ports = Arc::clone(&host_ports);
+            let link = Arc::clone(&link);
+            let first_seen = Arc::new(AtomicBool::new(false));
+            let device_name = cfg.name.clone();
+            move || -> InputCallback {
+                let p = Arc::clone(&proxy);
+                let h = Arc::clone(&host_ports);
+                let l = Arc::clone(&link);
+                let fs = Arc::clone(&first_seen);
+                let dn = device_name.clone();
+                Box::new(move |msg: &[u8]| {
+                    if !fs.swap(true, Ordering::Relaxed) {
+                        info!(device = %dn, bytes = msg.len(), "first device input event");
+                    }
+                    let outs = {
+                        let mut p = p.lock().unwrap();
+                        p.handle_device_in(msg)
+                    };
+                    dispatch_per_port_windows(&outs, &h, &l);
+                })
+            }
+        };
+
+        // Initial connect. Soft-fail: supervisor will keep retrying if
+        // the physical device isn't reachable yet.
+        let cb = make_cb();
+        if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
+            warn!(
+                device = %cfg.name,
+                error = %e,
+                "physical device not reachable at startup; supervisor will keep retrying"
+            );
         }
-    };
 
-    // Initial connect. Soft-fail: supervisor will keep retrying if the
-    // physical device isn't reachable yet.
-    let cb = make_cb();
-    if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
-        warn!(
-            device = %cfg.name,
-            error = %e,
-            "physical device not reachable at startup; supervisor will keep retrying"
+        spawn_supervisor(
+            cfg.name.clone(),
+            cfg.port_match.output().to_string(),
+            cfg.clone(),
+            Arc::clone(&proxy),
+            Arc::clone(&link),
+            make_cb,
         );
-    }
 
-    spawn_supervisor(
-        cfg.name.clone(),
-        cfg.port_match.output().to_string(),
-        cfg.clone(),
-        Arc::clone(&proxy),
-        Arc::clone(&link),
-        make_cb,
-    );
+        info!(
+            device = %cfg.name,
+            mode = "per_port",
+            pages,
+            "device ready"
+        );
+        wait_for_shutdown();
+        Ok(())
+    })();
 
-    info!(
-        device = %cfg.name,
-        mode = "per_port",
-        pages,
-        "device ready"
-    );
-    wait_for_shutdown();
-
-    // Force WindowsHostPort::Drop on each per-page endpoint while this
-    // thread is still alive. See the note in run_note_offset above for
-    // why the implicit drop on function return doesn't fire (Arc cycle
-    // through the plugin shim's captured `Arc<host_ports>`).
-    //
-    // Drop in parallel via thread::scope: WindowsHostPort::Drop spends
-    // ~500 ms in DisconnectEndpointConnection + MidiSession::Close, so
-    // sequential 7-page teardown overran the Win32 console handler's
-    // 2.5 s budget. Mirrors the parallel creation pattern above.
+    // Force WindowsHostPort::Drop on each per-page endpoint, unconditionally.
+    // Two reasons: (1) the plugin shim's input callback captures
+    // Arc<host_ports>, forming a reference cycle that would otherwise keep
+    // every WindowsHostPort alive past process exit; (2) on an error path
+    // (e.g. wait_for_ports timeout) we still need to release whatever was
+    // registered so midisrv doesn't accumulate leaked endpoints across
+    // runs. Drop in parallel via thread::scope; each WindowsHostPort::Drop
+    // takes ~500 ms in midisrv RPCs.
     let ports_to_drop: Vec<ports::WindowsHostPort> = {
         let mut guard = host_ports.lock().unwrap();
         guard.iter_mut().filter_map(|slot| slot.take()).collect()
@@ -849,9 +860,8 @@ fn run_per_port(
             s.spawn(move || drop(port));
         }
     });
-    let name_refs: Vec<&str> = port_names.iter().map(String::as_str).collect();
     settle_midisrv(&cfg.name, &name_refs);
-    Ok(())
+    result
 }
 
 #[cfg(target_os = "windows")]
