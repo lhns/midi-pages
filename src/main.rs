@@ -11,6 +11,12 @@ use std::time::Duration;
 /// wedges the MIDI subsystem (requires a reboot to recover).
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Per-device worker thread handles. The Win32 console handler and the
+/// named-event watcher both read this to unpark workers when shutdown is
+/// requested. Populated once at startup.
+#[cfg(target_os = "windows")]
+static THREADS: std::sync::OnceLock<Vec<thread::Thread>> = std::sync::OnceLock::new();
+
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -43,6 +49,13 @@ struct Args {
     /// Pops a UAC prompt; we do not auto-elevate silently.
     #[arg(long)]
     restart_midisrv: bool,
+
+    /// Send a graceful-shutdown signal to a running midi-pages.exe and
+    /// return. With no argument, auto-discovers a single running instance
+    /// (fails if zero or multiple exist). With a pid argument, targets
+    /// that specific instance. Windows-only.
+    #[arg(long, value_name = "PID", num_args = 0..=1, default_missing_value = "0")]
+    stop: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -74,6 +87,11 @@ fn main() -> Result<()> {
         return restart_midisrv();
     }
 
+    if let Some(raw) = args.stop {
+        let target = if raw == 0 { None } else { Some(raw) };
+        return graceful_stop(target);
+    }
+
     let cfg = Config::load(&args.config)
         .with_context(|| format!("load config {}", args.config.display()))?;
 
@@ -102,6 +120,8 @@ fn main() -> Result<()> {
     // cleanup. On other platforms we use the `ctrlc` crate (SIGINT / SIGTERM).
     let thread_handles: Vec<thread::Thread> = handles.iter().map(|h| h.thread().clone()).collect();
     install_shutdown_handler(thread_handles);
+    #[cfg(target_os = "windows")]
+    install_shutdown_event_watcher();
 
     for h in handles {
         let _ = h.join();
@@ -122,14 +142,12 @@ fn install_shutdown_handler(threads: Vec<thread::Thread>) {
         info!("shutdown signal received");
         trigger_shutdown(&threads);
     }) {
-        warn!("failed to install signal handler: {e} — force-killing this process may leak resources");
+        warn!("failed to install signal handler: {e}. Force-killing this process may leak resources.");
     }
 }
 
 #[cfg(target_os = "windows")]
 fn install_shutdown_handler(threads: Vec<thread::Thread>) {
-    use std::sync::OnceLock;
-    static THREADS: OnceLock<Vec<thread::Thread>> = OnceLock::new();
     if THREADS.set(threads).is_err() {
         warn!("shutdown handler already installed");
         return;
@@ -172,7 +190,7 @@ fn install_shutdown_handler(threads: Vec<thread::Thread>) {
     let rc = unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
     if rc == 0 {
         warn!(
-            "SetConsoleCtrlHandler failed: {} — force-killing this process may leak WMS resources",
+            "SetConsoleCtrlHandler failed: {}. Force-killing this process may leak WMS resources.",
             std::io::Error::last_os_error()
         );
     }
@@ -203,7 +221,7 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
     // Open device side (real USB MIDI) — the same in either mode.
     let device_out = Arc::new(Mutex::new(ports::open_output_named(
         &format!("midi-pages-{}-device-out", cfg.name),
-        &cfg.port_match,
+        cfg.port_match.output(),
     )?));
     info!("real device output opened");
 
@@ -219,7 +237,7 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
     }
     {
         let p = proxy.lock().unwrap();
-        let initial = p.device().paint_indicators(0, &cfg.page_buttons);
+        let initial = p.paint_indicator_state();
         let mut dev = device_out.lock().unwrap();
         for bytes in initial {
             let _ = dev.send(&bytes);
@@ -272,7 +290,7 @@ fn run_note_offset(
     let device_out_dev = Arc::clone(&device_out);
     let _device_in = open_device_input(
         &format!("midi-pages-{}-device-in", cfg.name),
-        &cfg.port_match,
+        cfg.port_match.input(),
         move |msg| {
             let outs = {
                 let mut p = p_dev.lock().unwrap();
@@ -337,7 +355,7 @@ fn run_per_port(
     let device_out_dev = Arc::clone(&device_out);
     let _device_in = open_device_input(
         &format!("midi-pages-{}-device-in", cfg.name),
-        &cfg.port_match,
+        cfg.port_match.input(),
         move |msg| {
             let outs = {
                 let mut p = p_dev.lock().unwrap();
@@ -355,25 +373,6 @@ fn run_per_port(
     );
     wait_for_shutdown();
     Ok(())
-}
-
-/// Schedule `bytes` to be sent to the real device after `delay_ms`. Used
-/// for the press-feedback flash on next/previous page buttons (the
-/// matching light-off arrives after a short delay so the LED is visibly
-/// on for ~`delay_ms` even on a tap-and-release). One-shot thread per
-/// flash; volume is bounded by human button-tap rates.
-fn schedule_delayed_device_send(
-    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
-    delay_ms: u32,
-    bytes: Vec<u8>,
-) {
-    let device_out = Arc::clone(device_out);
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(delay_ms as u64));
-        if let Err(e) = device_out.lock().unwrap().send(&bytes) {
-            warn!("delayed device send: {e}");
-        }
-    });
 }
 
 #[cfg(target_os = "windows")]
@@ -395,9 +394,6 @@ fn dispatch_offset_windows(
                 if let Err(e) = device_out.lock().unwrap().send(b) {
                     warn!("device send: {e}");
                 }
-            }
-            Out::DeviceDelayedSend { delay_ms, bytes } => {
-                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
             }
             Out::ToHostPage { .. } => {
                 warn!("got ToHostPage in note_offset mode; dropping");
@@ -426,9 +422,6 @@ fn dispatch_per_port_windows(
                 if let Err(e) = device_out.lock().unwrap().send(b) {
                     warn!("device send: {e}");
                 }
-            }
-            Out::DeviceDelayedSend { delay_ms, bytes } => {
-                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
             }
             Out::ToHost(_) => {
                 warn!("got ToHost in per_port mode; dropping");
@@ -482,7 +475,7 @@ fn run_note_offset(
     let device_out_dev = Arc::clone(&device_out);
     let _device_in = open_or_virtual_input(
         &format!("midi-pages-{}-device-in", cfg.name),
-        &cfg.port_match,
+        cfg.port_match.input(),
         move |msg| {
             let outs = {
                 let mut p = p_dev.lock().unwrap();
@@ -541,7 +534,7 @@ fn run_per_port(
     let device_out_dev = Arc::clone(&device_out);
     let _device_in = open_or_virtual_input(
         &format!("midi-pages-{}-device-in", cfg.name),
-        &cfg.port_match,
+        cfg.port_match.input(),
         move |msg| {
             let outs = {
                 let mut p = p_dev.lock().unwrap();
@@ -596,9 +589,6 @@ fn dispatch_offset(
                     warn!("device send: {e}");
                 }
             }
-            Out::DeviceDelayedSend { delay_ms, bytes } => {
-                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
-            }
             Out::ToHostPage { .. } => {
                 warn!("got ToHostPage in note_offset mode; dropping");
             }
@@ -625,9 +615,6 @@ fn dispatch_per_port(
                 if let Err(e) = device_out.lock().unwrap().send(b) {
                     warn!("device send: {e}");
                 }
-            }
-            Out::DeviceDelayedSend { delay_ms, bytes } => {
-                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
             }
             Out::ToHost(_) => {
                 warn!("got ToHost in per_port mode; dropping");
@@ -729,6 +716,128 @@ fn restart_midisrv() -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 fn restart_midisrv() -> Result<()> {
     Err(anyhow!("--restart-midisrv is Windows-only"))
+}
+
+#[cfg(target_os = "windows")]
+fn graceful_stop(target_pid: Option<u32>) -> Result<()> {
+    use midi_pages::shutdown;
+
+    let pid = match target_pid {
+        Some(p) => p,
+        None => {
+            let mut pids = find_proxy_pids_except_self()?;
+            match pids.len() {
+                0 => {
+                    info!("no other midi-pages.exe instance found; nothing to stop");
+                    return Ok(());
+                }
+                1 => pids.remove(0),
+                _ => {
+                    return Err(anyhow!(
+                        "{} midi-pages.exe instances running ({:?}). Re-run with --stop <pid>.",
+                        pids.len(),
+                        pids
+                    ));
+                }
+            }
+        }
+    };
+
+    let (handle, namespace) = shutdown::open_shutdown_event(pid).ok_or_else(|| {
+        anyhow!(
+            "could not open shutdown event for PID {pid} in Global\\ or Local\\. \
+             Is a midi-pages proxy with the event watcher actually running there?"
+        )
+    })?;
+    info!(target_pid = pid, namespace = %namespace.prefix(), "signalling shutdown event");
+    shutdown::signal_event(handle).map_err(|e| anyhow!("SetEvent failed: {e}"))?;
+
+    // Match the proxy's handler 2.5 s settle window plus a small margin.
+    thread::sleep(Duration::from_millis(3000));
+    info!("graceful_stop complete");
+    Ok(())
+}
+
+/// Spawn a Win32 named-event watcher thread. The thread blocks on
+/// `WaitForSingleObject` until something else opens the event by name and
+/// `SetEvent`s it (typically `midi-pages --stop`), then flips `SHUTDOWN`
+/// and unparks all workers, identical to what the console handler does
+/// for Ctrl+C.
+#[cfg(target_os = "windows")]
+fn install_shutdown_event_watcher() {
+    use midi_pages::shutdown;
+
+    let pid = std::process::id();
+    let created = match shutdown::create_shutdown_event(pid) {
+        Some(c) => c,
+        None => {
+            warn!(
+                "could not create shutdown event in Global\\ or Local\\; \
+                 `midi-pages --stop` will not be able to reach this process"
+            );
+            return;
+        }
+    };
+    info!(
+        namespace = %created.namespace.prefix(),
+        event_name = %shutdown::event_name(created.namespace, pid),
+        "shutdown event watcher armed"
+    );
+    let handle = created.handle;
+    let _ = thread::Builder::new()
+        .name("midi-pages-shutdown-event".into())
+        .spawn(move || {
+            let rc =
+                unsafe { shutdown::WaitForSingleObject(handle, shutdown::INFINITE) };
+            if rc == shutdown::WAIT_OBJECT_0 {
+                info!("shutdown event signalled");
+                if let Some(threads) = THREADS.get() {
+                    trigger_shutdown(threads);
+                }
+            } else {
+                warn!(rc, "shutdown event waiter returned unexpected code");
+            }
+            // Intentional leak: the OS reclaims the handle on process exit.
+            // CloseHandle here would race with another --stop attempt that
+            // could open before we exit.
+        });
+}
+
+#[cfg(target_os = "windows")]
+fn find_proxy_pids_except_self() -> Result<Vec<u32>> {
+    let self_pid = std::process::id();
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq midi-pages.exe", "/FO", "CSV", "/NH"])
+        .output()
+        .context("running tasklist to enumerate midi-pages.exe")?;
+    if !output.status.success() {
+        return Err(anyhow!("tasklist exited with {}", output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut pids = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // CSV row: "midi-pages.exe","1234","Console","1","18,044 K"
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let pid_str = fields[1].trim().trim_matches('"');
+        if let Ok(pid) = pid_str.parse::<u32>()
+            && pid != self_pid
+        {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn graceful_stop(_target_pid: Option<u32>) -> Result<()> {
+    Err(anyhow!("--stop is Windows-only"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

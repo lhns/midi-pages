@@ -1,7 +1,7 @@
 //! End-to-end integration: drive a Proxy with a sequence of MIDI events
 //! and assert the per-page LED cache and the streams it emits look right.
 
-use midi_pages::config::{ButtonRef, DeviceConfig, Mode};
+use midi_pages::config::{ButtonRef, ColorConfig, DeviceConfig, Mode, PortMatch};
 use midi_pages::midi::apc_mini::ApcMini;
 use midi_pages::midi::device::Driver;
 use midi_pages::midi::mini_mk3::MiniMk3;
@@ -12,7 +12,7 @@ use midi_pages::proxy::{CacheKey, LedCell, Out, Proxy};
 fn cfg(driver: Driver, pages: u8, mode: Mode) -> DeviceConfig {
     DeviceConfig {
         name: "test".into(),
-        port_match: "x".into(),
+        port_match: PortMatch::Simple("x".into()),
         driver,
         pages,
         mode,
@@ -39,6 +39,8 @@ fn cfg(driver: Driver, pages: u8, mode: Mode) -> DeviceConfig {
         }),
         page_buttons: vec![],
         page_buttons_hold_to_preview: false,
+        colors: ColorConfig::default(),
+        global_buttons: vec![],
     }
 }
 

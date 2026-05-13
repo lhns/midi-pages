@@ -53,30 +53,11 @@ impl Device for ApcMini {
             .collect()
     }
 
-    fn paint_indicators(&self, page: u8, indicators: &[ButtonRef]) -> Vec<Vec<u8>> {
-        indicators
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let v = if i as u8 == page {
-                    color::GREEN
-                } else {
-                    color::OFF
-                };
-                self.paint_button(*b, v)
-            })
-            .collect()
-    }
-
     fn paint_button(&self, btn: ButtonRef, color: u8) -> Vec<u8> {
         match btn {
             ButtonRef::Cc { number } => parse::cc(0, number, color).to_vec(),
             ButtonRef::Note { number } => parse::note_on(0, number, color).to_vec(),
         }
-    }
-
-    fn flash_color(&self) -> u8 {
-        color::GREEN
     }
 }
 

@@ -19,9 +19,6 @@ pub trait Device: Send + Sync {
     /// Bytes that wipe all grid LEDs to off. Called before replaying a page.
     fn clear_all(&self) -> Vec<Vec<u8>>;
 
-    /// Paint indicator LEDs to show `page` (1-of-N).
-    fn paint_indicators(&self, page: u8, indicators: &[ButtonRef]) -> Vec<Vec<u8>>;
-
     /// Paint a single button (next/prev or a page button) at the given color.
     /// Color semantics are device-specific; `0` always means off. Returns one
     /// MIDI message (CC or Note On as per the ButtonRef variant).
@@ -31,9 +28,6 @@ pub trait Device: Send + Sync {
     fn clear_button(&self, btn: ButtonRef) -> Vec<u8> {
         self.paint_button(btn, 0)
     }
-
-    /// Color for the brief "press feedback" flash on next/prev buttons.
-    fn flash_color(&self) -> u8;
 }
 
 /// Drivers known by name in config.toml.
