@@ -293,6 +293,8 @@ fn wait_for_shutdown() {
 /// drives reconnect latency; this watchdog only adds standalone
 /// diagnostics, so a slower cadence keeps midisrv enumeration traffic low.
 fn spawn_presence_watchdog(device_name: String, needle: String) {
+    // JoinHandle dropped by design: the watchdog observes SHUTDOWN on its
+    // park_timeout wake-up and self-terminates within ~5 s.
     let _ = thread::Builder::new()
         .name(format!("midi-pages:{device_name}:presence"))
         .spawn(move || {
@@ -445,6 +447,10 @@ where
         cfg.port_match.output(),
     )?;
 
+    // Boot SysEx and the driver's boot bytes are fire-and-forget: a
+    // failed write here would surface as a `device send` warn from the
+    // supervisor's first real message anyway, and the user doesn't want
+    // a startup error if the device is just slow to accept bytes.
     if let Some(sysex) = &cfg.boot_sysex {
         let _ = out.send(sysex);
     }
@@ -453,7 +459,8 @@ where
     }
 
     // Restore the device's visible state: page-button indicators + cached
-    // LED state for the persistent (or previewed) page.
+    // LED state for the persistent (or previewed) page. Same fire-and-
+    // forget rationale as the boot bytes above.
     let restore: Vec<Vec<u8>> = {
         let p = proxy.lock().unwrap();
         let mut bytes_list = p.paint_indicator_state();
@@ -502,6 +509,9 @@ where
         cfg.port_match.output(),
     )?;
 
+    // Boot SysEx + driver boot + restore are fire-and-forget. Same
+    // rationale as the Windows variant: a failure here surfaces as a
+    // device send warn from the supervisor's first real message.
     if let Some(sysex) = &cfg.boot_sysex {
         let _ = out.send(sysex);
     }
@@ -555,6 +565,9 @@ fn spawn_supervisor<F>(
 ) where
     F: Fn() -> InputCallback + Send + 'static,
 {
+    // JoinHandle dropped by design: the supervisor observes SHUTDOWN at
+    // each tick (every ~1 s park_timeout) and self-terminates after
+    // releasing both link.out and link.in_conn.
     let _ = thread::Builder::new()
         .name(format!("midi-pages:{device_name}:supervisor"))
         .spawn(move || {
@@ -949,6 +962,14 @@ fn run_note_offset(
         .as_deref()
         .ok_or_else(|| anyhow!("note_offset mode requires host_port_out"))?;
 
+    // Note on cleanup-on-error: unlike the Windows variant (which has the
+    // WMS plugin shim's Arc-cycle issue requiring an explicit take()
+    // teardown wrapped in a closure — see commit 5151b94), midir on
+    // ALSA/CoreMIDI doesn't have an equivalent hidden-ref hazard. Every
+    // resource here is owned via plain stack locals + Arc, so an early
+    // `?` propagation drops them in reverse order naturally and midir
+    // releases the OS-side ports. No closure-wrap needed on this path.
+
     // Cross-device register gate: midir's virtual-port creation assigns
     // IDs in call order; serializing across devices keeps that ordering
     // deterministic the same way it does on Windows/midisrv. The gate
@@ -1038,6 +1059,12 @@ fn run_per_port(
 ) -> Result<()> {
     let pages = cfg.pages;
     let port_names = cfg.page_port_names();
+
+    // Note: unlike the Windows run_per_port (commit 5151b94 wraps its body
+    // in a closure to guarantee teardown on any exit path), this midir-side
+    // path doesn't have the WMS plugin-shim Arc-cycle. midir releases
+    // OS-side ports cleanly when the Arcs drop, and an early `?`
+    // propagation here drops them in stack order naturally.
 
     // Each page exposes ONE virtual port name. midir on Unix creates
     // separate input + output sub-ports under the same name. The
