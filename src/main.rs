@@ -36,6 +36,12 @@ struct DeviceLink {
     error_signal: AtomicBool,
 }
 
+/// Boxed input-event callback shape used everywhere midir hands us bytes.
+/// Aliased here mostly so the closure-factory return types stay readable
+/// (and so clippy::type_complexity doesn't trip on the four `make_cb`
+/// sites that build per-mode dispatch closures).
+type InputCallback = Box<dyn Fn(&[u8]) + Send + 'static>;
+
 impl DeviceLink {
     fn new() -> Self {
         Self {
@@ -444,7 +450,7 @@ fn spawn_supervisor<F>(
     link: Arc<DeviceLink>,
     make_callback: F,
 ) where
-    F: Fn() -> Box<dyn Fn(&[u8]) + Send + 'static> + Send + 'static,
+    F: Fn() -> InputCallback + Send + 'static,
 {
     let _ = thread::Builder::new()
         .name(format!("midi-pages:{device_name}:supervisor"))
@@ -534,7 +540,7 @@ fn run_note_offset(
         let proxy = Arc::clone(&proxy);
         let host_port = Arc::clone(&host_port);
         let link = Arc::clone(&link);
-        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+        move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_port);
             let l = Arc::clone(&link);
@@ -612,7 +618,7 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
         let proxy = Arc::clone(&proxy);
         let host_ports = Arc::clone(&host_ports);
         let link = Arc::clone(&link);
-        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+        move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_ports);
             let l = Arc::clone(&link);
@@ -756,7 +762,7 @@ fn run_note_offset(
         let proxy = Arc::clone(&proxy);
         let host_out = Arc::clone(&host_out);
         let link = Arc::clone(&link);
-        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+        move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_out);
             let l = Arc::clone(&link);
@@ -830,7 +836,7 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
         let proxy = Arc::clone(&proxy);
         let host_outs = Arc::clone(&host_outs);
         let link = Arc::clone(&link);
-        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+        move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_outs);
             let l = Arc::clone(&link);
