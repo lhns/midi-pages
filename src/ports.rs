@@ -83,7 +83,7 @@ pub fn open_output_named(client: &str, needle: &str) -> Result<midir::MidiOutput
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_host::{PendingHostPort, WindowsHostPort, wait_for_ports};
+pub use windows_host::{PendingHostPort, WindowsHostPort, wait_for_ports, wait_for_ports_gone};
 
 #[cfg(target_os = "windows")]
 mod windows_host {
@@ -277,6 +277,43 @@ mod windows_host {
                 connection_id: self.connection_id,
                 endpoint_name: self.endpoint_name,
             }
+        }
+    }
+
+    /// Poll WinMM enumeration until none of the listed `names` appear, or
+    /// `timeout` elapses. Inverse of `wait_for_ports`; used at shutdown to
+    /// confirm that midisrv has actually removed each WMS Virtual Device
+    /// from external enumeration before the proxy considers cleanup
+    /// complete. Same single-snapshot-per-tick shape; returns the names
+    /// that didn't disappear in time.
+    pub fn wait_for_ports_gone(names: &[&str], timeout: Duration) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        let target: std::collections::HashSet<String> =
+            names.iter().map(|s| s.to_string()).collect();
+        loop {
+            let mi = MidiInput::new("midi-pages-probe-in")?;
+            let visible: std::collections::HashSet<String> = mi
+                .ports()
+                .iter()
+                .map(|p| mi.port_name(p).unwrap_or_default())
+                .collect();
+            let still_there: Vec<&String> = target.intersection(&visible).collect();
+            if still_there.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let mut names: Vec<String> = still_there.into_iter().cloned().collect();
+                names.sort();
+                return Err(anyhow!(
+                    "WMS Virtual endpoints still visible in WinMM after {:?}: {:?}",
+                    timeout,
+                    names
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 

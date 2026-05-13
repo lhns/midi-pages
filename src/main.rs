@@ -319,26 +319,34 @@ fn spawn_presence_watchdog(device_name: String, needle: String) {
         });
 }
 
-/// Keep the proxy process alive for a few seconds after WMS Virtual Device
-/// teardown completes. The Drop chain itself is synchronous and clean
+/// Block until WMS Virtual Devices have actually disappeared from WinMM
+/// enumeration, then a small extra margin. The Drop chain is synchronous
 /// (DisconnectEndpointConnection + MidiSession::Close return before this
-/// runs), but midisrv has a longstanding race: an external WinMM port
-/// enumeration arriving within ~hundreds of ms of just-deleted Virtual
-/// Devices can trip a midisrv-internal bug that wedges the service and any
-/// app currently enumerating (notably DasLight refreshing its MIDI list
-/// right after Ctrl-C). Holding our process alive past Drop gives midisrv
-/// uncontested time to finalize its state before the dead-PID cleanup or
-/// any external enumeration can race with it. 3 s is empirically generous;
-/// tune if the wedge still reproduces with a shorter window.
+/// runs) but midisrv historically lagged on removing the endpoint from
+/// external enumeration; an app enumerating in that window (notably
+/// DasLight refreshing its MIDI list right after Ctrl-C) used to wedge.
+/// Polling for invisibility gives us an evidence-based shutdown signal
+/// instead of a fixed-duration sleep — finishes as soon as midisrv is
+/// caught up, and surfaces a warn log if it never catches up.
+///
+/// The trailing 250 ms margin is a deliberate belt-and-braces grace
+/// period in case midisrv keeps reconciling internal state after the
+/// WinMM-visibility flip.
 #[cfg(target_os = "windows")]
-fn settle_midisrv(device_name: &str) {
-    const SETTLE: Duration = Duration::from_secs(3);
+fn settle_midisrv(device_name: &str, port_names: &[&str]) {
+    if port_names.is_empty() {
+        return;
+    }
     info!(
         device = %device_name,
-        seconds = SETTLE.as_secs(),
-        "letting midisrv settle before exit"
+        ports = port_names.len(),
+        "waiting for midisrv to drop endpoints from WinMM enumeration"
     );
-    thread::sleep(SETTLE);
+    match ports::wait_for_ports_gone(port_names, Duration::from_secs(10)) {
+        Ok(()) => info!(device = %device_name, "endpoints gone from WinMM"),
+        Err(e) => warn!(device = %device_name, "wait_for_ports_gone: {e}"),
+    }
+    thread::sleep(Duration::from_millis(250));
     info!(device = %device_name, "shutdown complete");
 }
 
@@ -617,7 +625,7 @@ fn run_note_offset(
     // CreateVirtualDevice. Taking the Option here releases the value (and
     // therefore the WMS resources) synchronously.
     let _dropped = host_port.lock().unwrap().take();
-    settle_midisrv(&cfg.name);
+    settle_midisrv(&cfg.name, &[host_name]);
     Ok(())
 }
 
@@ -723,7 +731,8 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
             s.spawn(move || drop(port));
         }
     });
-    settle_midisrv(&cfg.name);
+    let name_refs: Vec<&str> = port_names.iter().map(String::as_str).collect();
+    settle_midisrv(&cfg.name, &name_refs);
     Ok(())
 }
 
