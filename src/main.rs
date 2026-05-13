@@ -179,6 +179,8 @@ fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     install_shutdown_event_watcher();
 
+    info!("all device threads spawned; Ctrl-C to exit");
+
     for h in handles {
         let _ = h.join();
     }
@@ -423,6 +425,11 @@ where
         cfg.port_match.input(),
         on_recv,
     )?;
+    info!(
+        device = %cfg.name,
+        port = %cfg.port_match.input(),
+        "device input connected"
+    );
 
     *link.out.lock().unwrap() = Some(out);
     *link.in_conn.lock().unwrap() = Some(in_conn);
@@ -474,6 +481,11 @@ where
         on_recv,
         false,
     )?;
+    info!(
+        device = %cfg.name,
+        port = %cfg.port_match.input(),
+        "device input connected"
+    );
 
     *link.out.lock().unwrap() = Some(out);
     *link.in_conn.lock().unwrap() = Some(in_conn);
@@ -582,16 +594,26 @@ fn run_note_offset(
     }
 
     // Device-side callback factory. Used both for the initial connect and
-    // by the supervisor on every reconnect.
+    // by the supervisor on every reconnect. `first_seen` is shared across
+    // all callbacks the factory ever produces, so we log exactly once per
+    // device for the very first input event seen — a quick check that
+    // midir's input subscription actually fires.
     let make_cb = {
         let proxy = Arc::clone(&proxy);
         let host_port = Arc::clone(&host_port);
         let link = Arc::clone(&link);
+        let first_seen = Arc::new(AtomicBool::new(false));
+        let device_name = cfg.name.clone();
         move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_port);
             let l = Arc::clone(&link);
+            let fs = Arc::clone(&first_seen);
+            let dn = device_name.clone();
             Box::new(move |msg: &[u8]| {
+                if !fs.swap(true, Ordering::Relaxed) {
+                    info!(device = %dn, bytes = msg.len(), "first device input event");
+                }
                 let outs = {
                     let mut p = p.lock().unwrap();
                     p.handle_device_in(msg)
@@ -614,7 +636,7 @@ fn run_note_offset(
         make_cb,
     );
 
-    info!(device = %cfg.name, mode = "note_offset", "running. Ctrl-C to exit.");
+    info!(device = %cfg.name, mode = "note_offset", "device ready");
     wait_for_shutdown();
 
     // Force WindowsHostPort::Drop to run while this thread is still alive.
@@ -674,15 +696,25 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
     }
 
     // Device-side callback factory; rebuilt each reconnect by the supervisor.
+    // `first_seen` is shared across all callbacks the factory produces so the
+    // first input event per device logs exactly once (a quick sanity check
+    // that midir's input subscription actually fires).
     let make_cb = {
         let proxy = Arc::clone(&proxy);
         let host_ports = Arc::clone(&host_ports);
         let link = Arc::clone(&link);
+        let first_seen = Arc::new(AtomicBool::new(false));
+        let device_name = cfg.name.clone();
         move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_ports);
             let l = Arc::clone(&link);
+            let fs = Arc::clone(&first_seen);
+            let dn = device_name.clone();
             Box::new(move |msg: &[u8]| {
+                if !fs.swap(true, Ordering::Relaxed) {
+                    info!(device = %dn, bytes = msg.len(), "first device input event");
+                }
                 let outs = {
                     let mut p = p.lock().unwrap();
                     p.handle_device_in(msg)
@@ -709,7 +741,7 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
         device = %cfg.name,
         mode = "per_port",
         pages,
-        "running. Ctrl-C to exit."
+        "device ready"
     );
     wait_for_shutdown();
 
@@ -843,11 +875,18 @@ fn run_note_offset(
         let proxy = Arc::clone(&proxy);
         let host_out = Arc::clone(&host_out);
         let link = Arc::clone(&link);
+        let first_seen = Arc::new(AtomicBool::new(false));
+        let device_name = cfg.name.clone();
         move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_out);
             let l = Arc::clone(&link);
+            let fs = Arc::clone(&first_seen);
+            let dn = device_name.clone();
             Box::new(move |msg: &[u8]| {
+                if !fs.swap(true, Ordering::Relaxed) {
+                    info!(device = %dn, bytes = msg.len(), "first device input event");
+                }
                 let outs = {
                     let mut p = p.lock().unwrap();
                     p.handle_device_in(msg)
@@ -869,7 +908,7 @@ fn run_note_offset(
         make_cb,
     );
 
-    info!(device = %cfg.name, mode = "note_offset", "running. Ctrl-C to exit.");
+    info!(device = %cfg.name, mode = "note_offset", "device ready");
     wait_for_shutdown();
     Ok(())
 }
@@ -917,11 +956,18 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
         let proxy = Arc::clone(&proxy);
         let host_outs = Arc::clone(&host_outs);
         let link = Arc::clone(&link);
+        let first_seen = Arc::new(AtomicBool::new(false));
+        let device_name = cfg.name.clone();
         move || -> InputCallback {
             let p = Arc::clone(&proxy);
             let h = Arc::clone(&host_outs);
             let l = Arc::clone(&link);
+            let fs = Arc::clone(&first_seen);
+            let dn = device_name.clone();
             Box::new(move |msg: &[u8]| {
+                if !fs.swap(true, Ordering::Relaxed) {
+                    info!(device = %dn, bytes = msg.len(), "first device input event");
+                }
                 let outs = {
                     let mut p = p.lock().unwrap();
                     p.handle_device_in(msg)
@@ -943,7 +989,7 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
         make_cb,
     );
 
-    info!(device = %cfg.name, mode = "per_port", pages, "running. Ctrl-C to exit.");
+    info!(device = %cfg.name, mode = "per_port", pages, "device ready");
     wait_for_shutdown();
     Ok(())
 }
