@@ -319,6 +319,29 @@ fn spawn_presence_watchdog(device_name: String, needle: String) {
         });
 }
 
+/// Keep the proxy process alive for a few seconds after WMS Virtual Device
+/// teardown completes. The Drop chain itself is synchronous and clean
+/// (DisconnectEndpointConnection + MidiSession::Close return before this
+/// runs), but midisrv has a longstanding race: an external WinMM port
+/// enumeration arriving within ~hundreds of ms of just-deleted Virtual
+/// Devices can trip a midisrv-internal bug that wedges the service and any
+/// app currently enumerating (notably DasLight refreshing its MIDI list
+/// right after Ctrl-C). Holding our process alive past Drop gives midisrv
+/// uncontested time to finalize its state before the dead-PID cleanup or
+/// any external enumeration can race with it. 3 s is empirically generous;
+/// tune if the wedge still reproduces with a shorter window.
+#[cfg(target_os = "windows")]
+fn settle_midisrv(device_name: &str) {
+    const SETTLE: Duration = Duration::from_secs(3);
+    info!(
+        device = %device_name,
+        seconds = SETTLE.as_secs(),
+        "letting midisrv settle before exit"
+    );
+    thread::sleep(SETTLE);
+    info!(device = %device_name, "shutdown complete");
+}
+
 fn make_device(driver: Driver) -> Box<dyn Device> {
     match driver {
         Driver::MiniMk3 => Box::new(MiniMk3),
@@ -590,6 +613,7 @@ fn run_note_offset(
     // CreateVirtualDevice. Taking the Option here releases the value (and
     // therefore the WMS resources) synchronously.
     let _dropped = host_port.lock().unwrap().take();
+    settle_midisrv(&cfg.name);
     Ok(())
 }
 
@@ -692,6 +716,7 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
             s.spawn(move || drop(port));
         }
     });
+    settle_midisrv(&cfg.name);
     Ok(())
 }
 
