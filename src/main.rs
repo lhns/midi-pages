@@ -19,7 +19,49 @@ static THREADS: std::sync::OnceLock<Vec<thread::Thread>> = std::sync::OnceLock::
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Shared per-device connection state. The supervisor thread is the only
+/// writer; dispatch paths and host-port callbacks hold `Arc<DeviceLink>`s
+/// and use `send_device` to push bytes to the physical device. When the
+/// device is disconnected, `out` is `None` and writes are silently dropped
+/// (their LED state is still cached in the proxy and will be replayed on
+/// reconnect). `error_signal` is set by `send_device` on a failed send so
+/// the supervisor can react on the next tick.
+struct DeviceLink {
+    out: Mutex<Option<midir::MidiOutputConnection>>,
+    /// Holds the input connection alive; midir's callback fires from its
+    /// own thread. Dropping this stops the callback.
+    in_conn: Mutex<Option<midir::MidiInputConnection<()>>>,
+    error_signal: AtomicBool,
+}
+
+impl DeviceLink {
+    fn new() -> Self {
+        Self {
+            out: Mutex::new(None),
+            in_conn: Mutex::new(None),
+            error_signal: AtomicBool::new(false),
+        }
+    }
+
+    /// Push bytes to the device if connected. Silently drops while
+    /// disconnected. Sets the error signal on send failure so the
+    /// supervisor sees it on its next tick.
+    fn send_device(&self, bytes: &[u8]) {
+        let mut guard = self.out.lock().unwrap();
+        if let Some(conn) = guard.as_mut()
+            && let Err(e) = conn.send(bytes)
+        {
+            warn!(
+                kind = "device-send",
+                bytes = bytes.len(),
+                "send failed: {e}"
+            );
+            self.error_signal.store(true, Ordering::Relaxed);
+        }
+    }
+}
 
 use midi_pages::config::{Config, DeviceConfig, Mode};
 use midi_pages::midi::apc_mini::ApcMini;
@@ -272,42 +314,187 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
     let proxy = Arc::new(Mutex::new(Proxy::new(cfg, device)));
 
     // Diagnostics: 1-second port-presence poll so we get an info-level log
-    // whenever the physical device disappears or reappears. Watchdog thread
-    // exits on SHUTDOWN within ~1s of the flag flipping.
+    // whenever the physical device disappears or reappears.
     spawn_presence_watchdog(cfg.name.clone(), cfg.port_match.output().to_string());
 
-    info!(device = %cfg.name, port_match = %cfg.port_match, "opening real device output");
-    // Open device side (real USB MIDI) — the same in either mode.
-    let device_out = Arc::new(Mutex::new(ports::open_output_named(
+    // Shared device-link. The mode-specific runner does the initial connect
+    // (so startup fails fast if the device isn't there yet, matching prior
+    // behaviour) and spawns a supervisor that handles unplug + replug.
+    let link = Arc::new(DeviceLink::new());
+
+    match cfg.mode {
+        Mode::NoteOffset => run_note_offset(cfg, proxy, link),
+        Mode::PerPort => run_per_port(cfg, proxy, link),
+    }
+}
+
+/// Open the device input + output, run the boot sequence, and push the
+/// proxy's current paint + cached page state. Used both at startup and by
+/// the supervisor on reconnect; same exact restore each time.
+#[cfg(target_os = "windows")]
+fn connect_device_link<F>(
+    cfg: &DeviceConfig,
+    proxy: &Arc<Mutex<Proxy>>,
+    link: &Arc<DeviceLink>,
+    on_recv: F,
+) -> Result<()>
+where
+    F: Fn(&[u8]) + Send + 'static,
+{
+    let mut out = ports::open_output_named(
         &format!("midi-pages-{}-device-out", cfg.name),
         cfg.port_match.output(),
-    )?));
-    info!("real device output opened");
+    )?;
 
-    // Boot the device (programmer mode etc.).
-    {
-        let mut dev = device_out.lock().unwrap();
-        if let Some(sysex) = &cfg.boot_sysex {
-            let _ = dev.send(sysex);
-        }
-        for bytes in make_device(cfg.driver).boot() {
-            let _ = dev.send(&bytes);
-        }
+    if let Some(sysex) = &cfg.boot_sysex {
+        let _ = out.send(sysex);
     }
-    {
+    for bytes in make_device(cfg.driver).boot() {
+        let _ = out.send(&bytes);
+    }
+
+    // Restore the device's visible state: page-button indicators + cached
+    // LED state for the persistent (or previewed) page.
+    let restore: Vec<Vec<u8>> = {
         let p = proxy.lock().unwrap();
-        let initial = p.paint_indicator_state();
-        let mut dev = device_out.lock().unwrap();
-        for bytes in initial {
-            let _ = dev.send(&bytes);
+        let mut bytes_list = p.paint_indicator_state();
+        for o in p.replay_page_to_device() {
+            if let Out::ToDevice(b) = o {
+                bytes_list.push(b);
+            }
         }
+        bytes_list
+    };
+    for bytes in restore {
+        let _ = out.send(&bytes);
     }
 
-    // Wire host-side I/O per mode.
-    match cfg.mode {
-        Mode::NoteOffset => run_note_offset(cfg, proxy, device_out),
-        Mode::PerPort => run_per_port(cfg, proxy, device_out),
+    let in_conn = open_device_input(
+        &format!("midi-pages-{}-device-in", cfg.name),
+        cfg.port_match.input(),
+        on_recv,
+    )?;
+
+    *link.out.lock().unwrap() = Some(out);
+    *link.in_conn.lock().unwrap() = Some(in_conn);
+    link.error_signal.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Linux/macOS variant: midir-native opens (no virtual fallback for the
+/// device side, since the physical device is supposed to exist).
+#[cfg(not(target_os = "windows"))]
+fn connect_device_link<F>(
+    cfg: &DeviceConfig,
+    proxy: &Arc<Mutex<Proxy>>,
+    link: &Arc<DeviceLink>,
+    on_recv: F,
+) -> Result<()>
+where
+    F: Fn(&[u8]) + Send + 'static,
+{
+    let mut out = ports::open_output_named(
+        &format!("midi-pages-{}-device-out", cfg.name),
+        cfg.port_match.output(),
+    )?;
+
+    if let Some(sysex) = &cfg.boot_sysex {
+        let _ = out.send(sysex);
     }
+    for bytes in make_device(cfg.driver).boot() {
+        let _ = out.send(&bytes);
+    }
+
+    let restore: Vec<Vec<u8>> = {
+        let p = proxy.lock().unwrap();
+        let mut bytes_list = p.paint_indicator_state();
+        for o in p.replay_page_to_device() {
+            if let Out::ToDevice(b) = o {
+                bytes_list.push(b);
+            }
+        }
+        bytes_list
+    };
+    for bytes in restore {
+        let _ = out.send(&bytes);
+    }
+
+    let in_conn = open_or_virtual_input(
+        &format!("midi-pages-{}-device-in", cfg.name),
+        cfg.port_match.input(),
+        on_recv,
+        false,
+    )?;
+
+    *link.out.lock().unwrap() = Some(out);
+    *link.in_conn.lock().unwrap() = Some(in_conn);
+    link.error_signal.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Generic reconnect loop. The supervisor wakes every second (or sooner if
+/// shutdown is requested) and decides whether to tear down + reconnect.
+/// `make_callback` returns a fresh input-callback closure on each reconnect
+/// (midir consumes the closure when registering it).
+fn spawn_supervisor<F>(
+    device_name: String,
+    needle: String,
+    cfg: DeviceConfig,
+    proxy: Arc<Mutex<Proxy>>,
+    link: Arc<DeviceLink>,
+    make_callback: F,
+) where
+    F: Fn() -> Box<dyn Fn(&[u8]) + Send + 'static> + Send + 'static,
+{
+    let _ = thread::Builder::new()
+        .name(format!("midi-pages:{device_name}:supervisor"))
+        .spawn(move || {
+            let client = format!("midi-pages-{device_name}-supervisor");
+            let mut backoff_ms = 250u64;
+            while !SHUTDOWN.load(Ordering::SeqCst) {
+                let connected = link.out.lock().unwrap().is_some();
+                if connected {
+                    let error = link.error_signal.swap(false, Ordering::Relaxed);
+                    let port_present = matches!(ports::port_present(&client, &needle), Ok(true));
+                    if !port_present {
+                        warn!(
+                            device = %device_name,
+                            "device link down (port absent); will retry"
+                        );
+                        *link.out.lock().unwrap() = None;
+                        *link.in_conn.lock().unwrap() = None;
+                        backoff_ms = 250;
+                    } else if error {
+                        // Send failed but the port still shows. Probably a
+                        // transient hiccup; clear the flag and keep going.
+                        debug!(
+                            device = %device_name,
+                            "send error while port present; not reconnecting"
+                        );
+                    }
+                    thread::park_timeout(Duration::from_secs(1));
+                } else {
+                    let cb = make_callback();
+                    match connect_device_link(&cfg, &proxy, &link, move |msg| cb(msg)) {
+                        Ok(()) => {
+                            info!(device = %device_name, "device reconnected");
+                            backoff_ms = 250;
+                        }
+                        Err(e) => {
+                            debug!(
+                                device = %device_name,
+                                "reconnect attempt failed: {e}"
+                            );
+                            thread::sleep(Duration::from_millis(backoff_ms));
+                            backoff_ms = (backoff_ms * 2).min(2000);
+                        }
+                    }
+                }
+            }
+            // On shutdown, drop both. Their Drop releases midir resources.
+            *link.out.lock().unwrap() = None;
+            *link.in_conn.lock().unwrap() = None;
+        });
 }
 
 // =========================================================================
@@ -318,46 +505,61 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
 fn run_note_offset(
     cfg: &DeviceConfig,
     proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
+    link: Arc<DeviceLink>,
 ) -> Result<()> {
     let host_name = cfg
         .host_port_in
         .as_deref()
         .ok_or_else(|| anyhow!("note_offset mode requires host_port_in"))?;
 
-    // Set up host side: ONE Virtual Device endpoint, plugin callback writes
-    // into the proxy; outgoing goes via .send() on the same handle.
-    let p_host = Arc::clone(&proxy);
-    let device_out_host = Arc::clone(&device_out);
-    // host_port.send is needed from the closure (for proxy outputs heading to
-    // host). We must construct it AFTER setting up the Arc<...>, but the
-    // closure also needs to call its send method — so we share it via Arc.
+    // Host side: ONE Virtual Device endpoint, plugin callback feeds the proxy.
     let host_port: Arc<Mutex<Option<ports::WindowsHostPort>>> = Arc::new(Mutex::new(None));
-    let host_port_for_cb = Arc::clone(&host_port);
-    let host_port_obj = ports::WindowsHostPort::create(host_name, move |msg| {
-        let outs = {
-            let mut p = p_host.lock().unwrap();
-            p.handle_host_in(msg)
-        };
-        dispatch_offset_windows(&outs, &host_port_for_cb, &device_out_host);
-    })?;
-    *host_port.lock().unwrap() = Some(host_port_obj);
-
-    // Device -> proxy -> host.
-    let p_dev = Arc::clone(&proxy);
-    let host_port_dev = Arc::clone(&host_port);
-    let device_out_dev = Arc::clone(&device_out);
-    let _device_in = open_device_input(
-        &format!("midi-pages-{}-device-in", cfg.name),
-        cfg.port_match.input(),
-        move |msg| {
+    {
+        let p_host = Arc::clone(&proxy);
+        let host_port_for_cb = Arc::clone(&host_port);
+        let link_for_cb = Arc::clone(&link);
+        let host_port_obj = ports::WindowsHostPort::create(host_name, move |msg| {
             let outs = {
-                let mut p = p_dev.lock().unwrap();
-                p.handle_device_in(msg)
+                let mut p = p_host.lock().unwrap();
+                p.handle_host_in(msg)
             };
-            dispatch_offset_windows(&outs, &host_port_dev, &device_out_dev);
-        },
-    )?;
+            dispatch_offset_windows(&outs, &host_port_for_cb, &link_for_cb);
+        })?;
+        *host_port.lock().unwrap() = Some(host_port_obj);
+    }
+
+    // Device-side callback factory. Used both for the initial connect and
+    // by the supervisor on every reconnect.
+    let make_cb = {
+        let proxy = Arc::clone(&proxy);
+        let host_port = Arc::clone(&host_port);
+        let link = Arc::clone(&link);
+        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+            let p = Arc::clone(&proxy);
+            let h = Arc::clone(&host_port);
+            let l = Arc::clone(&link);
+            Box::new(move |msg: &[u8]| {
+                let outs = {
+                    let mut p = p.lock().unwrap();
+                    p.handle_device_in(msg)
+                };
+                dispatch_offset_windows(&outs, &h, &l);
+            })
+        }
+    };
+
+    // Initial connect (fail-fast at startup if the device isn't there).
+    let cb = make_cb();
+    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+
+    spawn_supervisor(
+        cfg.name.clone(),
+        cfg.port_match.output().to_string(),
+        cfg.clone(),
+        Arc::clone(&proxy),
+        Arc::clone(&link),
+        make_cb,
+    );
 
     info!(device = %cfg.name, mode = "note_offset", "running. Ctrl-C to exit.");
     wait_for_shutdown();
@@ -365,11 +567,7 @@ fn run_note_offset(
 }
 
 #[cfg(target_os = "windows")]
-fn run_per_port(
-    cfg: &DeviceConfig,
-    proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
-) -> Result<()> {
+fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLink>) -> Result<()> {
     let pages = cfg.pages;
     let port_names = cfg.page_port_names();
 
@@ -387,7 +585,7 @@ fn run_per_port(
         for (page_idx, host_name) in port_names.iter().enumerate() {
             let p = Arc::clone(&proxy);
             let host_ports_for_cb = Arc::clone(&host_ports);
-            let device_out_for_cb = Arc::clone(&device_out);
+            let link_for_cb = Arc::clone(&link);
             let host_ports_insert = Arc::clone(&host_ports);
             let page = page_idx as u8;
             handles.push(s.spawn(move || -> Result<()> {
@@ -396,7 +594,7 @@ fn run_per_port(
                         let mut p = p.lock().unwrap();
                         p.handle_host_in_per_port(page, msg)
                     };
-                    dispatch_per_port_windows(&outs, &host_ports_for_cb, &device_out_for_cb);
+                    dispatch_per_port_windows(&outs, &host_ports_for_cb, &link_for_cb);
                 })?;
                 host_ports_insert.lock().unwrap()[page_idx] = Some(port);
                 Ok(())
@@ -409,21 +607,37 @@ fn run_per_port(
         Ok(())
     })?;
 
-    // Device -> proxy -> currently-active host port.
-    let p_dev = Arc::clone(&proxy);
-    let host_ports_dev = Arc::clone(&host_ports);
-    let device_out_dev = Arc::clone(&device_out);
-    let _device_in = open_device_input(
-        &format!("midi-pages-{}-device-in", cfg.name),
-        cfg.port_match.input(),
-        move |msg| {
-            let outs = {
-                let mut p = p_dev.lock().unwrap();
-                p.handle_device_in(msg)
-            };
-            dispatch_per_port_windows(&outs, &host_ports_dev, &device_out_dev);
-        },
-    )?;
+    // Device-side callback factory; rebuilt each reconnect by the supervisor.
+    let make_cb = {
+        let proxy = Arc::clone(&proxy);
+        let host_ports = Arc::clone(&host_ports);
+        let link = Arc::clone(&link);
+        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+            let p = Arc::clone(&proxy);
+            let h = Arc::clone(&host_ports);
+            let l = Arc::clone(&link);
+            Box::new(move |msg: &[u8]| {
+                let outs = {
+                    let mut p = p.lock().unwrap();
+                    p.handle_device_in(msg)
+                };
+                dispatch_per_port_windows(&outs, &h, &l);
+            })
+        }
+    };
+
+    // Initial connect (fail-fast at startup).
+    let cb = make_cb();
+    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+
+    spawn_supervisor(
+        cfg.name.clone(),
+        cfg.port_match.output().to_string(),
+        cfg.clone(),
+        Arc::clone(&proxy),
+        Arc::clone(&link),
+        make_cb,
+    );
 
     info!(
         device = %cfg.name,
@@ -439,7 +653,7 @@ fn run_per_port(
 fn dispatch_offset_windows(
     outs: &[Out],
     host_port: &Arc<Mutex<Option<ports::WindowsHostPort>>>,
-    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
+    link: &Arc<DeviceLink>,
 ) {
     for o in outs {
         match o {
@@ -450,11 +664,7 @@ fn dispatch_offset_windows(
                     warn!("host send: {e}");
                 }
             }
-            Out::ToDevice(b) => {
-                if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
-                }
-            }
+            Out::ToDevice(b) => link.send_device(b),
             Out::ToHostPage { .. } => {
                 warn!("got ToHostPage in note_offset mode; dropping");
             }
@@ -466,7 +676,7 @@ fn dispatch_offset_windows(
 fn dispatch_per_port_windows(
     outs: &[Out],
     host_ports: &Arc<Mutex<Vec<Option<ports::WindowsHostPort>>>>,
-    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
+    link: &Arc<DeviceLink>,
 ) {
     for o in outs {
         match o {
@@ -478,11 +688,7 @@ fn dispatch_per_port_windows(
                     warn!(page = %page, "host send: {e}");
                 }
             }
-            Out::ToDevice(b) => {
-                if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
-                }
-            }
+            Out::ToDevice(b) => link.send_device(b),
             Out::ToHost(_) => {
                 warn!("got ToHost in per_port mode; dropping");
             }
@@ -515,7 +721,7 @@ where
 fn run_note_offset(
     cfg: &DeviceConfig,
     proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
+    link: Arc<DeviceLink>,
 ) -> Result<()> {
     let host_in_name = cfg
         .host_port_in
@@ -530,25 +736,9 @@ fn run_note_offset(
         open_or_virtual_output(&format!("midi-pages-{}-host-out", cfg.name), host_out_name)?,
     ));
 
-    let p_dev = Arc::clone(&proxy);
-    let host_out_dev = Arc::clone(&host_out);
-    let device_out_dev = Arc::clone(&device_out);
-    let _device_in = open_or_virtual_input(
-        &format!("midi-pages-{}-device-in", cfg.name),
-        cfg.port_match.input(),
-        move |msg| {
-            let outs = {
-                let mut p = p_dev.lock().unwrap();
-                p.handle_device_in(msg)
-            };
-            dispatch_offset(&outs, &host_out_dev, &device_out_dev);
-        },
-        false,
-    )?;
-
     let p_host = Arc::clone(&proxy);
     let host_out_host = Arc::clone(&host_out);
-    let device_out_host = Arc::clone(&device_out);
+    let link_host = Arc::clone(&link);
     let _host_in = open_or_virtual_input(
         &format!("midi-pages-{}-host-in", cfg.name),
         host_in_name,
@@ -557,10 +747,40 @@ fn run_note_offset(
                 let mut p = p_host.lock().unwrap();
                 p.handle_host_in(msg)
             };
-            dispatch_offset(&outs, &host_out_host, &device_out_host);
+            dispatch_offset(&outs, &host_out_host, &link_host);
         },
         true,
     )?;
+
+    let make_cb = {
+        let proxy = Arc::clone(&proxy);
+        let host_out = Arc::clone(&host_out);
+        let link = Arc::clone(&link);
+        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+            let p = Arc::clone(&proxy);
+            let h = Arc::clone(&host_out);
+            let l = Arc::clone(&link);
+            Box::new(move |msg: &[u8]| {
+                let outs = {
+                    let mut p = p.lock().unwrap();
+                    p.handle_device_in(msg)
+                };
+                dispatch_offset(&outs, &h, &l);
+            })
+        }
+    };
+
+    let cb = make_cb();
+    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+
+    spawn_supervisor(
+        cfg.name.clone(),
+        cfg.port_match.output().to_string(),
+        cfg.clone(),
+        Arc::clone(&proxy),
+        Arc::clone(&link),
+        make_cb,
+    );
 
     info!(device = %cfg.name, mode = "note_offset", "running. Ctrl-C to exit.");
     wait_for_shutdown();
@@ -568,11 +788,7 @@ fn run_note_offset(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn run_per_port(
-    cfg: &DeviceConfig,
-    proxy: Arc<Mutex<Proxy>>,
-    device_out: Arc<Mutex<midir::MidiOutputConnection>>,
-) -> Result<()> {
+fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLink>) -> Result<()> {
     let pages = cfg.pages;
     let port_names = cfg.page_port_names();
 
@@ -589,27 +805,11 @@ fn run_per_port(
     }
     let host_outs = Arc::new(host_outs);
 
-    let p_dev = Arc::clone(&proxy);
-    let host_outs_dev = Arc::clone(&host_outs);
-    let device_out_dev = Arc::clone(&device_out);
-    let _device_in = open_or_virtual_input(
-        &format!("midi-pages-{}-device-in", cfg.name),
-        cfg.port_match.input(),
-        move |msg| {
-            let outs = {
-                let mut p = p_dev.lock().unwrap();
-                p.handle_device_in(msg)
-            };
-            dispatch_per_port(&outs, &host_outs_dev, &device_out_dev);
-        },
-        false,
-    )?;
-
     let mut _host_inputs = Vec::new();
     for (page_idx, name) in port_names.iter().enumerate() {
         let p = Arc::clone(&proxy);
         let host_outs = Arc::clone(&host_outs);
-        let device_out = Arc::clone(&device_out);
+        let link = Arc::clone(&link);
         let page = page_idx as u8;
         let conn = open_or_virtual_input(
             &format!("midi-pages-{}-page{}-in", cfg.name, page_idx + 1),
@@ -619,12 +819,42 @@ fn run_per_port(
                     let mut p = p.lock().unwrap();
                     p.handle_host_in_per_port(page, msg)
                 };
-                dispatch_per_port(&outs, &host_outs, &device_out);
+                dispatch_per_port(&outs, &host_outs, &link);
             },
             true,
         )?;
         _host_inputs.push(conn);
     }
+
+    let make_cb = {
+        let proxy = Arc::clone(&proxy);
+        let host_outs = Arc::clone(&host_outs);
+        let link = Arc::clone(&link);
+        move || -> Box<dyn Fn(&[u8]) + Send + 'static> {
+            let p = Arc::clone(&proxy);
+            let h = Arc::clone(&host_outs);
+            let l = Arc::clone(&link);
+            Box::new(move |msg: &[u8]| {
+                let outs = {
+                    let mut p = p.lock().unwrap();
+                    p.handle_device_in(msg)
+                };
+                dispatch_per_port(&outs, &h, &l);
+            })
+        }
+    };
+
+    let cb = make_cb();
+    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+
+    spawn_supervisor(
+        cfg.name.clone(),
+        cfg.port_match.output().to_string(),
+        cfg.clone(),
+        Arc::clone(&proxy),
+        Arc::clone(&link),
+        make_cb,
+    );
 
     info!(device = %cfg.name, mode = "per_port", pages, "running. Ctrl-C to exit.");
     wait_for_shutdown();
@@ -635,7 +865,7 @@ fn run_per_port(
 fn dispatch_offset(
     outs: &[Out],
     host_out: &Arc<Mutex<midir::MidiOutputConnection>>,
-    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
+    link: &Arc<DeviceLink>,
 ) {
     for o in outs {
         match o {
@@ -644,11 +874,7 @@ fn dispatch_offset(
                     warn!("host send: {e}");
                 }
             }
-            Out::ToDevice(b) => {
-                if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
-                }
-            }
+            Out::ToDevice(b) => link.send_device(b),
             Out::ToHostPage { .. } => {
                 warn!("got ToHostPage in note_offset mode; dropping");
             }
@@ -660,7 +886,7 @@ fn dispatch_offset(
 fn dispatch_per_port(
     outs: &[Out],
     host_outs: &Arc<Vec<Arc<Mutex<midir::MidiOutputConnection>>>>,
-    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
+    link: &Arc<DeviceLink>,
 ) {
     for o in outs {
         match o {
@@ -671,11 +897,7 @@ fn dispatch_per_port(
                     warn!(page = %page, "host send: {e}");
                 }
             }
-            Out::ToDevice(b) => {
-                if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
-                }
-            }
+            Out::ToDevice(b) => link.send_device(b),
             Out::ToHost(_) => {
                 warn!("got ToHost in per_port mode; dropping");
             }

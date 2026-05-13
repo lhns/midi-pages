@@ -774,7 +774,10 @@ impl Proxy {
         out
     }
 
-    fn replay_page_to_device(&self) -> Vec<Out> {
+    /// Emit the cached LED state for the current page as a sequence of
+    /// `Out::ToDevice` writes. Called on page-change and on reconnect to
+    /// restore the visible page after the device is back.
+    pub fn replay_page_to_device(&self) -> Vec<Out> {
         let cache = &self.led_cache[self.current_page as usize];
         if cache.is_empty() {
             return Vec::new();
