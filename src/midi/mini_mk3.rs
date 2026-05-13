@@ -52,22 +52,35 @@ impl Device for MiniMk3 {
 
     fn paint_indicators(&self, page: u8, indicators: &[ButtonRef]) -> Vec<Vec<u8>> {
         // Light the indicator at slot `page` green, others dim white.
-        const COLOR_ACTIVE: u8 = 21; // green
-        const COLOR_INACTIVE: u8 = 1; // dim white
         indicators
             .iter()
             .enumerate()
             .map(|(i, b)| {
                 let v = if i as u8 == page {
-                    COLOR_ACTIVE
+                    color::ACTIVE
                 } else {
-                    COLOR_INACTIVE
+                    color::INACTIVE
                 };
-                match b {
-                    ButtonRef::Cc { number } => parse::cc(0, *number, v).to_vec(),
-                    ButtonRef::Note { number } => parse::note_on(0, *number, v).to_vec(),
-                }
+                self.paint_button(*b, v)
             })
             .collect()
     }
+
+    fn paint_button(&self, btn: ButtonRef, color: u8) -> Vec<u8> {
+        match btn {
+            ButtonRef::Cc { number } => parse::cc(0, number, color).to_vec(),
+            ButtonRef::Note { number } => parse::note_on(0, number, color).to_vec(),
+        }
+    }
+
+    fn flash_color(&self) -> u8 {
+        color::ACTIVE
+    }
+}
+
+/// Mini MK3 LED color codes used by the proxy.
+pub mod color {
+    pub const OFF: u8 = 0;
+    pub const INACTIVE: u8 = 1; // dim white
+    pub const ACTIVE: u8 = 21; // green
 }

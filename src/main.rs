@@ -219,7 +219,7 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
     }
     {
         let p = proxy.lock().unwrap();
-        let initial = p.device().paint_indicators(0, &cfg.indicator_leds);
+        let initial = p.device().paint_indicators(0, &cfg.page_buttons);
         let mut dev = device_out.lock().unwrap();
         for bytes in initial {
             let _ = dev.send(&bytes);
@@ -357,6 +357,25 @@ fn run_per_port(
     Ok(())
 }
 
+/// Schedule `bytes` to be sent to the real device after `delay_ms`. Used
+/// for the press-feedback flash on next/previous page buttons (the
+/// matching light-off arrives after a short delay so the LED is visibly
+/// on for ~`delay_ms` even on a tap-and-release). One-shot thread per
+/// flash; volume is bounded by human button-tap rates.
+fn schedule_delayed_device_send(
+    device_out: &Arc<Mutex<midir::MidiOutputConnection>>,
+    delay_ms: u32,
+    bytes: Vec<u8>,
+) {
+    let device_out = Arc::clone(device_out);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(delay_ms as u64));
+        if let Err(e) = device_out.lock().unwrap().send(&bytes) {
+            warn!("delayed device send: {e}");
+        }
+    });
+}
+
 #[cfg(target_os = "windows")]
 fn dispatch_offset_windows(
     outs: &[Out],
@@ -376,6 +395,9 @@ fn dispatch_offset_windows(
                 if let Err(e) = device_out.lock().unwrap().send(b) {
                     warn!("device send: {e}");
                 }
+            }
+            Out::DeviceDelayedSend { delay_ms, bytes } => {
+                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
             }
             Out::ToHostPage { .. } => {
                 warn!("got ToHostPage in note_offset mode; dropping");
@@ -404,6 +426,9 @@ fn dispatch_per_port_windows(
                 if let Err(e) = device_out.lock().unwrap().send(b) {
                     warn!("device send: {e}");
                 }
+            }
+            Out::DeviceDelayedSend { delay_ms, bytes } => {
+                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
             }
             Out::ToHost(_) => {
                 warn!("got ToHost in per_port mode; dropping");
@@ -571,6 +596,9 @@ fn dispatch_offset(
                     warn!("device send: {e}");
                 }
             }
+            Out::DeviceDelayedSend { delay_ms, bytes } => {
+                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
+            }
             Out::ToHostPage { .. } => {
                 warn!("got ToHostPage in note_offset mode; dropping");
             }
@@ -597,6 +625,9 @@ fn dispatch_per_port(
                 if let Err(e) = device_out.lock().unwrap().send(b) {
                     warn!("device send: {e}");
                 }
+            }
+            Out::DeviceDelayedSend { delay_ms, bytes } => {
+                schedule_delayed_device_send(device_out, *delay_ms, bytes.clone());
             }
             Out::ToHost(_) => {
                 warn!("got ToHost in per_port mode; dropping");

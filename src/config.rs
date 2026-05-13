@@ -54,10 +54,30 @@ pub struct DeviceConfig {
 
     #[serde(default, deserialize_with = "deserialize_optional_sysex")]
     pub boot_sysex: Option<Vec<u8>>,
-    pub page_up_button: ButtonRef,
-    pub page_down_button: ButtonRef,
+
+    /// Optional: physical button that advances to the next page when pressed.
+    /// On press the LED briefly flashes (~200 ms) for visual feedback.
     #[serde(default)]
-    pub indicator_leds: Vec<ButtonRef>,
+    pub next_page_button: Option<ButtonRef>,
+
+    /// Optional: physical button that returns to the previous page.
+    #[serde(default)]
+    pub previous_page_button: Option<ButtonRef>,
+
+    /// Optional: one button per page that both indicates the active page
+    /// (with an LED) and, when tapped, jumps directly to that page (Mode B).
+    /// With `page_buttons_hold_to_preview`, holding instead temporarily
+    /// swaps the grid to that page (Mode C). May be shorter than `pages`;
+    /// extra entries (longer than `pages`) are rejected.
+    #[serde(default)]
+    pub page_buttons: Vec<ButtonRef>,
+
+    /// Mode C: when true, page_buttons act as hold-to-preview switches —
+    /// the persistent page is changed only via next/prev. When false (or
+    /// page_buttons is empty), tapping a page button jumps persistently to
+    /// that page (Mode B). Requires `page_buttons` to be non-empty.
+    #[serde(default)]
+    pub page_buttons_hold_to_preview: bool,
 }
 
 impl DeviceConfig {
@@ -138,19 +158,57 @@ impl Config {
                     d.name
                 )));
             }
-            if d.page_up_button == d.page_down_button {
+            // pages > 1 needs *some* navigation method.
+            if d.pages > 1
+                && d.next_page_button.is_none()
+                && d.previous_page_button.is_none()
+                && d.page_buttons.is_empty()
+            {
                 return Err(ConfigError::Invalid(format!(
-                    "{}: page_up_button and page_down_button must differ",
+                    "{}: pages > 1 requires at least one of next_page_button, \
+                     previous_page_button, or page_buttons",
                     d.name
                 )));
             }
-            if d.indicator_leds.contains(&d.page_up_button)
-                || d.indicator_leds.contains(&d.page_down_button)
+            if let (Some(n), Some(p)) = (d.next_page_button, d.previous_page_button)
+                && n == p
             {
                 return Err(ConfigError::Invalid(format!(
-                    "{}: indicator_leds collides with a page button",
+                    "{}: next_page_button and previous_page_button must differ",
                     d.name
                 )));
+            }
+            if d.page_buttons_hold_to_preview && d.page_buttons.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "{}: page_buttons_hold_to_preview requires page_buttons to be non-empty",
+                    d.name
+                )));
+            }
+            if d.page_buttons.len() > d.pages as usize {
+                return Err(ConfigError::Invalid(format!(
+                    "{}: page_buttons has {} entries but pages = {} — extras would be unreachable",
+                    d.name,
+                    d.page_buttons.len(),
+                    d.pages
+                )));
+            }
+            // page_buttons entries must be unique among themselves and not
+            // collide with next/prev.
+            for (i, a) in d.page_buttons.iter().enumerate() {
+                for b in &d.page_buttons[i + 1..] {
+                    if a == b {
+                        return Err(ConfigError::Invalid(format!(
+                            "{}: page_buttons contains duplicate entry",
+                            d.name
+                        )));
+                    }
+                }
+                if Some(*a) == d.next_page_button || Some(*a) == d.previous_page_button {
+                    return Err(ConfigError::Invalid(format!(
+                        "{}: page_buttons collides with next/previous_page_button",
+                        d.name
+                    )));
+                }
             }
             match d.mode {
                 Mode::NoteOffset => {
@@ -246,27 +304,27 @@ mod tests {
 
     const VALID_NOTE_OFFSET: &str = r#"
 [[device]]
-name             = "Mini"
-port_match       = "Launchpad Mini"
-mode             = "note_offset"
-host_port_in     = "host-in"
-host_port_out    = "host-out"
-driver           = "mini_mk3"
-pages            = 2
-note_offset      = 64
-boot_sysex       = "F0 00 20 29 02 0D 0E 01 F7"
-page_up_button   = { kind = "cc", number = 91 }
-page_down_button = { kind = "cc", number = 92 }
+name                 = "Mini"
+port_match           = "Launchpad Mini"
+mode                 = "note_offset"
+host_port_in         = "host-in"
+host_port_out        = "host-out"
+driver               = "mini_mk3"
+pages                = 2
+note_offset          = 64
+boot_sysex           = "F0 00 20 29 02 0D 0E 01 F7"
+next_page_button     = { kind = "cc", number = 91 }
+previous_page_button = { kind = "cc", number = 92 }
 "#;
 
     const VALID_PER_PORT: &str = r#"
 [[device]]
-name             = "Launchpad Mini MK3"
-port_match       = "Launchpad Mini"
-driver           = "mini_mk3"
-pages            = 4
-page_up_button   = { kind = "cc", number = 91 }
-page_down_button = { kind = "cc", number = 92 }
+name                 = "Launchpad Mini MK3"
+port_match           = "Launchpad Mini"
+driver               = "mini_mk3"
+pages                = 4
+next_page_button     = { kind = "cc", number = 91 }
+previous_page_button = { kind = "cc", number = 92 }
 "#;
 
     #[test]
@@ -295,13 +353,13 @@ page_down_button = { kind = "cc", number = 92 }
 
     #[test]
     fn rejects_zero_pages() {
-        let bad = VALID_NOTE_OFFSET.replace("pages            = 2", "pages            = 0");
+        let bad = VALID_NOTE_OFFSET.replace("pages                = 2", "pages                = 0");
         let cfg: Config = toml::from_str(&bad).unwrap();
         assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
     }
 
     #[test]
-    fn rejects_same_button_for_up_and_down() {
+    fn rejects_same_button_for_next_and_previous() {
         let bad = VALID_NOTE_OFFSET.replace("number = 92", "number = 91");
         let cfg: Config = toml::from_str(&bad).unwrap();
         assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
@@ -317,7 +375,7 @@ page_down_button = { kind = "cc", number = 92 }
     #[test]
     fn rejects_excessive_pages_for_midi_range() {
         // 4 pages * 64 = 256 > 128 in note_offset mode: must be rejected.
-        let bad = VALID_NOTE_OFFSET.replace("pages            = 2", "pages            = 4");
+        let bad = VALID_NOTE_OFFSET.replace("pages                = 2", "pages                = 4");
         let cfg: Config = toml::from_str(&bad).unwrap();
         let err = cfg.validate().unwrap_err();
         match err {
@@ -329,7 +387,7 @@ page_down_button = { kind = "cc", number = 92 }
     #[test]
     fn per_port_mode_allows_many_pages() {
         // What note_offset rejects, per_port allows.
-        let many = VALID_PER_PORT.replace("pages            = 4", "pages            = 16");
+        let many = VALID_PER_PORT.replace("pages                = 4", "pages                = 16");
         let cfg: Config = toml::from_str(&many).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.devices[0].page_port_names().len(), 16);
@@ -345,18 +403,123 @@ page_down_button = { kind = "cc", number = 92 }
     #[test]
     fn rejects_note_offset_without_host_ports() {
         let bad = VALID_NOTE_OFFSET
-            .replace("host_port_in     = \"host-in\"\n", "")
-            .replace("host_port_out    = \"host-out\"\n", "");
+            .replace("host_port_in         = \"host-in\"\n", "")
+            .replace("host_port_out        = \"host-out\"\n", "");
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg.validate().unwrap_err();
+        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        assert!(s.contains("host_port_in"), "{s}");
+    }
+
+    #[test]
+    fn rejects_page_button_collision_with_next_prev() {
+        let bad =
+            VALID_NOTE_OFFSET.to_string() + "page_buttons = [ { kind = \"cc\", number = 91 } ]\n";
         let cfg: Config = toml::from_str(&bad).unwrap();
         assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
     }
 
     #[test]
-    fn rejects_indicator_collision() {
-        let bad =
-            VALID_NOTE_OFFSET.to_string() + "indicator_leds = [ { kind = \"cc\", number = 91 } ]\n";
+    fn rejects_hold_to_preview_without_page_buttons() {
+        let bad = VALID_PER_PORT.to_string() + "page_buttons_hold_to_preview = true\n";
         let cfg: Config = toml::from_str(&bad).unwrap();
-        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+        let err = cfg.validate().unwrap_err();
+        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        assert!(s.contains("page_buttons_hold_to_preview"), "{s}");
+    }
+
+    #[test]
+    fn rejects_no_page_navigation_when_pages_gt_1() {
+        let bad = r#"
+[[device]]
+name        = "Mini"
+port_match  = "Launchpad Mini"
+driver      = "mini_mk3"
+pages       = 4
+"#;
+        let cfg: Config = toml::from_str(bad).unwrap();
+        let err = cfg.validate().unwrap_err();
+        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        assert!(s.contains("pages > 1 requires"), "{s}");
+    }
+
+    #[test]
+    fn allows_no_navigation_when_pages_eq_1() {
+        let single = r#"
+[[device]]
+name        = "Mini"
+port_match  = "Launchpad Mini"
+driver      = "mini_mk3"
+pages       = 1
+"#;
+        let cfg: Config = toml::from_str(single).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_all_three_modes() {
+        // Mode A: only next/prev.
+        let a = r#"
+[[device]]
+name = "Mini"
+port_match = "Launchpad Mini"
+driver = "mini_mk3"
+pages = 4
+next_page_button     = { kind = "cc", number = 91 }
+previous_page_button = { kind = "cc", number = 92 }
+"#;
+        toml::from_str::<Config>(a).unwrap().validate().unwrap();
+
+        // Mode B: page_buttons (no hold).
+        let b = r#"
+[[device]]
+name = "Mini"
+port_match = "Launchpad Mini"
+driver = "mini_mk3"
+pages = 4
+page_buttons = [
+  { kind = "cc", number = 89 },
+  { kind = "cc", number = 79 },
+  { kind = "cc", number = 69 },
+  { kind = "cc", number = 59 },
+]
+"#;
+        toml::from_str::<Config>(b).unwrap().validate().unwrap();
+
+        // Mode C: page_buttons + hold + optional next/prev.
+        let c = r#"
+[[device]]
+name = "Mini"
+port_match = "Launchpad Mini"
+driver = "mini_mk3"
+pages = 4
+next_page_button     = { kind = "cc", number = 91 }
+previous_page_button = { kind = "cc", number = 92 }
+page_buttons = [
+  { kind = "cc", number = 89 },
+  { kind = "cc", number = 79 },
+  { kind = "cc", number = 69 },
+  { kind = "cc", number = 59 },
+]
+page_buttons_hold_to_preview = true
+"#;
+        toml::from_str::<Config>(c).unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_too_many_page_buttons() {
+        let bad = VALID_PER_PORT.to_string()
+            + "page_buttons = [
+              { kind = \"cc\", number = 89 },
+              { kind = \"cc\", number = 79 },
+              { kind = \"cc\", number = 69 },
+              { kind = \"cc\", number = 59 },
+              { kind = \"cc\", number = 49 },
+            ]\n";
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg.validate().unwrap_err();
+        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        assert!(s.contains("entries but pages"), "{s}");
     }
 
     #[test]

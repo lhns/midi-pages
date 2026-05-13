@@ -2,7 +2,13 @@
 
 A virtual MIDI paging proxy for the Novation **Launchpad Mini MK3** and the Akai **APC mini**, primarily intended for use with **DasLight** (and any other host that maps MIDI notes to scenes/effects).
 
-The 8x8 grid only gives you 64 buttons. `midi-pages` sits between your host software and the controller, reserves two physical buttons as **page up / page down**, and presents N pages of 64 pads to the host. LED state is cached per page so switching pages instantly redraws the correct LEDs without the host re-sending anything.
+The 8x8 grid only gives you 64 buttons. `midi-pages` sits between your host software and the controller, lets you reserve a few physical buttons for **page navigation**, and presents N pages of 64 pads to the host. LED state is cached per page so switching pages instantly redraws the correct LEDs without the host re-sending anything.
+
+Three navigation styles compose freely (see [ADR 0007](docs/adr/0007-configurable-page-buttons.md)):
+
+- **Sequential** — `next_page_button` + `previous_page_button` walk through pages.
+- **Direct jump** — `page_buttons` (one per page) tap to jump to that page; their LEDs indicate the active page.
+- **Hold-to-preview** — `page_buttons` + `page_buttons_hold_to_preview = true`: hold a page button to interactively swap the grid to that page (pads pressed with another finger fire on the previewed page); release to revert. Persistent page is moved only via next/prev.
 
 ## Modes
 
@@ -27,7 +33,7 @@ A single virtual port pair; pages are encoded by adding `note_offset` to the not
    └──────────┘  ◄──────  └─────────────────────────────┘ ◄──────  └──────────────────┘
 ```
 
-- **Device → host:** pad press at physical note `n` while page `p` is active is sent to page `p`'s host port (per-port mode), or rewritten as note `n + p*64` (note-offset mode). The two configured page-cycle buttons are swallowed and never reach the host.
+- **Device → host:** pad press at physical note `n` while page `p` is active is sent to page `p`'s host port (per-port mode), or rewritten as note `n + p*64` (note-offset mode). The configured navigation buttons (next/prev/page_buttons) are swallowed and never reach the host.
 - **Host → device:** message arrives on page `p`'s port (or addressed to logical note in page `p` in note-offset mode). If `p` is active, forwarded to the device; otherwise cached for that page.
 - **Page change:** the device LEDs are cleared, then `led_cache[new_page]` is replayed in one batch. Held physical pads emit a Note Off on the previous page so the host sees no stuck notes.
 
@@ -51,7 +57,7 @@ A single virtual port pair; pages are encoded by adding `note_offset` to the not
 
 ## Configuration
 
-See `config.toml.example`. The two reserved page-cycle buttons are configurable per device (`kind = "note" | "cc"`, plus `number`).
+See `config.toml.example`. All page-navigation buttons are configurable per device (`kind = "note" | "cc"`, plus `number`); see [ADR 0007](docs/adr/0007-configurable-page-buttons.md) for the three usage modes.
 
 ### DAW configuration: route everything through the proxy
 

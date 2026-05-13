@@ -29,15 +29,16 @@ fn cfg(driver: Driver, pages: u8, mode: Mode) -> DeviceConfig {
         note_offset: Some(64),
         page_port_prefix: None,
         boot_sysex: None,
-        page_up_button: match driver {
+        next_page_button: Some(match driver {
             Driver::MiniMk3 => ButtonRef::Cc { number: 91 },
             Driver::ApcMini => ButtonRef::Note { number: 98 },
-        },
-        page_down_button: match driver {
+        }),
+        previous_page_button: Some(match driver {
             Driver::MiniMk3 => ButtonRef::Cc { number: 92 },
             Driver::ApcMini => ButtonRef::Note { number: 99 },
-        },
-        indicator_leds: vec![],
+        }),
+        page_buttons: vec![],
+        page_buttons_hold_to_preview: false,
     }
 }
 

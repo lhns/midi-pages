@@ -63,12 +63,20 @@ impl Device for ApcMini {
                 } else {
                     color::OFF
                 };
-                match b {
-                    ButtonRef::Cc { number } => parse::cc(0, *number, v).to_vec(),
-                    ButtonRef::Note { number } => parse::note_on(0, *number, v).to_vec(),
-                }
+                self.paint_button(*b, v)
             })
             .collect()
+    }
+
+    fn paint_button(&self, btn: ButtonRef, color: u8) -> Vec<u8> {
+        match btn {
+            ButtonRef::Cc { number } => parse::cc(0, number, color).to_vec(),
+            ButtonRef::Note { number } => parse::note_on(0, number, color).to_vec(),
+        }
+    }
+
+    fn flash_color(&self) -> u8 {
+        color::GREEN
     }
 }
 

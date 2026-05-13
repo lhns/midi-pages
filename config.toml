@@ -1,21 +1,4 @@
-# midi-pages example configuration.
-# Copy to config.toml and edit. Run `midi-pages --list-ports` to see the exact
-# port names reported by your OS.
-#
-# Two modes:
-#
-#   mode = "per_port"   (default, recommended)
-#       The proxy creates ONE virtual port pair PER PAGE. Each page presents
-#       an identical Launchpad/APC layout to the host. No 7-bit MIDI ceiling,
-#       up to 16+ pages possible. On Windows the proxy auto-creates the
-#       loopMIDI ports it needs (loopMIDI must be installed and running).
-#       On Linux/macOS virtual ports are created natively.
-#
-#   mode = "note_offset"
-#       Single virtual port pair; pages encoded by adding `note_offset` to
-#       the note number. Fits at most ~2 pages of 64 pads (pages*note_offset
-#       must be <= 128). DasLight maps each pad on each page as a different
-#       note. Requires host_port_in / host_port_out to be set.
+# midi-pages live configuration. See config.toml.example for full docs.
 
 [[device]]
 name             = "Launchpad Mini MK3"
@@ -23,15 +6,22 @@ port_match       = "LPMiniMK3 MIDI)"
 driver           = "mini_mk3"
 mode             = "per_port"
 pages            = 4
-# Switch the device to programmer mode on startup so SysEx LED control works.
 boot_sysex       = "F0 00 20 29 02 0D 0E 01 F7"
-# Two physical buttons reserved for paging. Mini MK3 top-row arrows are CC 91/92.
-page_up_button   = { kind = "cc", number = 91 }
-page_down_button = { kind = "cc", number = 92 }
-# Optional: physical buttons whose LEDs indicate the current page.
-indicator_leds   = [
+
+# Mode A: top-row arrows walk pages sequentially.
+next_page_button     = { kind = "cc", number = 92 }
+previous_page_button = { kind = "cc", number = 91 }
+
+# Mode B: side-strip buttons jump directly to a page when tapped, and
+# their LEDs indicate the active page.
+page_buttons = [
   { kind = "cc", number = 89 },
   { kind = "cc", number = 79 },
   { kind = "cc", number = 69 },
   { kind = "cc", number = 59 },
 ]
+
+# Mode C (off by default): set true to make the side-strip buttons
+# preview a page only while held, reverting to the persistent page on
+# release. Persistent page is then moved only via next/previous_page_button.
+# page_buttons_hold_to_preview = true

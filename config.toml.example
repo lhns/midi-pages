@@ -1,50 +1,79 @@
 # midi-pages example configuration.
-# Copy to config.toml and edit. Run `midi-pages --list-ports` to see the exact
-# port names reported by your OS.
+# Copy to config.toml and edit. Run `midi-pages --list-ports` to see the
+# exact port names reported by your OS.
 #
-# Two modes:
+# Two transport modes (per device):
 #
 #   mode = "per_port"   (default, recommended)
 #       The proxy creates ONE virtual MIDI endpoint PER PAGE, named
-#       `<device-slug>-page<N>`. Each page presents an identical Launchpad/APC
-#       layout to the host. No 7-bit MIDI ceiling; up to 16+ pages possible.
-#       On Linux/macOS the endpoints are created natively via `midir`. On
-#       Windows the proxy calls the Windows MIDI Services WinRT API directly
-#       (see ADR 0012); the WMS runtime DLL must be installed.
+#       `<device-slug>-page<N>`. Each page presents an identical
+#       Launchpad/APC layout to the host. No 7-bit MIDI ceiling; up to
+#       16+ pages possible. On Linux/macOS endpoints are created
+#       natively via `midir`. On Windows the proxy calls Windows MIDI
+#       Services (see ADR 0012); the WMS runtime DLL must be installed.
 #
 #   mode = "note_offset"
 #       Single host port pair; pages encoded by adding `note_offset` to
-#       the note number. Fits at most ~2 pages of 64 pads (pages*note_offset
-#       must be <= 128). DasLight maps each pad on each page as a different
-#       note. Requires host_port_in / host_port_out to be set.
+#       the note number. Fits at most ~2 pages of 64 pads
+#       (pages * note_offset must be <= 128). Requires host_port_in /
+#       host_port_out to be set.
+#
+# Three page-navigation usage modes (combined freely; see ADR 0007):
+#
+#   Mode A — sequential
+#       Configure `next_page_button` and/or `previous_page_button`.
+#       Walk pages with two physical buttons. Each press emits a brief
+#       (~200 ms) LED flash on the button as visual feedback.
+#
+#   Mode B — direct jump
+#       Configure `page_buttons` — one button per page. Tapping a button
+#       jumps persistently to that page. The button LEDs always indicate
+#       the active page. Combine freely with Mode A buttons.
+#
+#   Mode C — hold-to-preview
+#       Configure `page_buttons` AND `page_buttons_hold_to_preview = true`.
+#       Hold a page button to TEMPORARILY swap the grid to that page —
+#       interactive: pressing other pads with another finger fires on
+#       the previewed page. Releasing reverts to the persistent page.
+#       The persistent page is moved only via next/previous_page_button.
 
 [[device]]
 name             = "Launchpad Mini MK3"
-# On Windows the Mini MK3 enumerates as TWO ports: `LPMiniMK3 MIDI` (port 1,
-# the DAW port) and `MIDIIN2/MIDIOUT2 (LPMiniMK3 MIDI)` (port 2, the MIDI
-# port). Programmer-mode SysEx and pad I/O go through port 2 — the closing
-# paren disambiguates. On Linux/macOS the simpler `"Launchpad Mini MK3"`
-# substring works.
+# On Windows the Mini MK3 enumerates as TWO ports: `LPMiniMK3 MIDI`
+# (port 1, the DAW port) and `MIDIIN2/MIDIOUT2 (LPMiniMK3 MIDI)` (port 2,
+# the MIDI port). Programmer-mode SysEx and pad I/O go through port 2 —
+# the closing paren disambiguates. On Linux/macOS the simpler
+# `"Launchpad Mini MK3"` substring works.
 port_match       = "LPMiniMK3 MIDI)"
 driver           = "mini_mk3"
 mode             = "per_port"
 pages            = 4
 # Switch the device to programmer mode on startup so SysEx LED control works.
 boot_sysex       = "F0 00 20 29 02 0D 0E 01 F7"
-# Two physical buttons reserved for paging. Mini MK3 top-row arrows are CC 91/92.
-page_up_button   = { kind = "cc", number = 91 }
-page_down_button = { kind = "cc", number = 92 }
-# Optional: physical buttons whose LEDs indicate the current page.
-indicator_leds   = [
+
+# Mode A: top-row arrows on the Mini MK3 are CC 91/92.
+next_page_button     = { kind = "cc", number = 91 }
+previous_page_button = { kind = "cc", number = 92 }
+
+# Mode B (optional): side-strip buttons act as both page indicators and
+# direct-jump targets. Slot index = page index (89 -> page 1, 79 -> page 2,
+# 69 -> page 3, 59 -> page 4). May be shorter than `pages` (those pages
+# just have no direct-jump button); cannot be longer.
+page_buttons = [
   { kind = "cc", number = 89 },
   { kind = "cc", number = 79 },
   { kind = "cc", number = 69 },
   { kind = "cc", number = 59 },
 ]
-# In per_port mode the proxy auto-generates port names from `name`. Override
-# with an explicit prefix if you want shorter names:
+
+# Mode C (default false): when true, page_buttons act as hold-to-preview
+# instead of direct jump. Persistent page is then moved only via
+# next/previous_page_button.
+# page_buttons_hold_to_preview = true
+
+# In per_port mode the proxy auto-generates port names from `name`.
+# Override with an explicit prefix if you want shorter names:
 # page_port_prefix = "lp"
-# That would create ports "lp-page1" through "lp-page4".
 
 [[device]]
 name             = "APC mini"
@@ -52,8 +81,10 @@ port_match       = "APC MINI"
 driver           = "apc_mini"
 mode             = "per_port"
 pages            = 8
-page_up_button   = { kind = "note", number = 98 }
-page_down_button = { kind = "note", number = 99 }
+# APC mini has no top-row arrow CCs; pick two grid corners or any unused
+# notes. Both fields are optional — Mode A only needs at least one of them.
+next_page_button     = { kind = "note", number = 98 }
+previous_page_button = { kind = "note", number = 99 }
 
 # Example of note_offset mode (capped at 2 pages with default offset of 64):
 #
@@ -66,5 +97,5 @@ page_down_button = { kind = "note", number = 99 }
 # note_offset      = 64
 # host_port_in     = "midi-pages-apc-out"
 # host_port_out    = "midi-pages-apc-in"
-# page_up_button   = { kind = "note", number = 98 }
-# page_down_button = { kind = "note", number = 99 }
+# next_page_button     = { kind = "note", number = 98 }
+# previous_page_button = { kind = "note", number = 99 }

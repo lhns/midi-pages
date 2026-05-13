@@ -36,17 +36,34 @@ pub enum Out {
     ToHostPage { page: u8, bytes: Vec<u8> },
     /// Send these bytes to the device (real USB-MIDI side).
     ToDevice(Vec<u8>),
+    /// Send these bytes to the device after a delay. Used for the
+    /// press-feedback flash on next/previous page buttons (light-on goes
+    /// out as a regular ToDevice; this variant carries the matching
+    /// light-off, scheduled `delay_ms` later).
+    DeviceDelayedSend { delay_ms: u32, bytes: Vec<u8> },
 }
 
 /// Proxy state and the two rewrite paths.
 pub struct Proxy {
     pub mode: Mode,
+    /// Page the user "lives on" — moved by next/prev or by tapping a page
+    /// button in Mode B. Persists across hold-preview windows.
+    pub persistent_page: u8,
+    /// `Some(p)` while a page button is held in Mode C; the grid is
+    /// temporarily showing page `p`. `None` otherwise.
+    pub held_preview: Option<u8>,
+    /// Which page button started the current preview (so we know which
+    /// release event ends it). `None` when not previewing.
+    held_preview_button: Option<ButtonRef>,
+    /// Cached visible page = `held_preview.unwrap_or(persistent_page)`.
+    /// Updated by `set_persistent_page` / `enter_preview` / `exit_preview`.
     pub current_page: u8,
     pub pages: u8,
     pub note_offset: u8,
-    pub page_up: ButtonRef,
-    pub page_down: ButtonRef,
-    pub indicators: Vec<ButtonRef>,
+    pub next_page_button: Option<ButtonRef>,
+    pub previous_page_button: Option<ButtonRef>,
+    pub page_buttons: Vec<ButtonRef>,
+    pub hold_to_preview: bool,
     pub driver: Driver,
 
     /// `led_cache[page][CacheKey] -> last LED state for that button on that page`.
@@ -65,12 +82,16 @@ impl Proxy {
         let pages = cfg.pages as usize;
         Self {
             mode: cfg.mode,
+            persistent_page: 0,
+            held_preview: None,
+            held_preview_button: None,
             current_page: 0,
             pages: cfg.pages,
             note_offset: cfg.note_offset_value(),
-            page_up: cfg.page_up_button,
-            page_down: cfg.page_down_button,
-            indicators: cfg.indicator_leds.clone(),
+            next_page_button: cfg.next_page_button,
+            previous_page_button: cfg.previous_page_button,
+            page_buttons: cfg.page_buttons.clone(),
+            hold_to_preview: cfg.page_buttons_hold_to_preview,
             driver: cfg.driver,
             led_cache: vec![HashMap::new(); pages],
             held: HashSet::new(),
@@ -94,11 +115,20 @@ impl Proxy {
                 note,
                 velocity,
             } => {
-                if self.is_button(ButtonRef::Note { number: note }, &self.page_up) {
-                    return self.cycle_page(true);
+                let btn = ButtonRef::Note { number: note };
+                let is_press = velocity > 0;
+                if Some(btn) == self.next_page_button {
+                    return if is_press { self.handle_next_press(btn) } else { Vec::new() };
                 }
-                if self.is_button(ButtonRef::Note { number: note }, &self.page_down) {
-                    return self.cycle_page(false);
+                if Some(btn) == self.previous_page_button {
+                    return if is_press { self.handle_previous_press(btn) } else { Vec::new() };
+                }
+                if let Some(slot) = self.page_button_slot(btn) {
+                    return if is_press {
+                        self.handle_page_button_press(slot, btn)
+                    } else {
+                        self.handle_page_button_release(btn)
+                    };
                 }
                 if !self.device.is_grid_note(note) {
                     return vec![self.to_host_current(bytes.to_vec())];
@@ -118,10 +148,12 @@ impl Proxy {
                 note,
                 velocity,
             } => {
-                if self.is_button(ButtonRef::Note { number: note }, &self.page_up)
-                    || self.is_button(ButtonRef::Note { number: note }, &self.page_down)
-                {
+                let btn = ButtonRef::Note { number: note };
+                if Some(btn) == self.next_page_button || Some(btn) == self.previous_page_button {
                     return Vec::new();
+                }
+                if self.page_button_slot(btn).is_some() {
+                    return self.handle_page_button_release(btn);
                 }
                 if !self.device.is_grid_note(note) {
                     return vec![self.to_host_current(bytes.to_vec())];
@@ -145,18 +177,19 @@ impl Proxy {
                 controller,
                 value,
             } => {
-                if self.is_button(ButtonRef::Cc { number: controller }, &self.page_up) {
-                    return if value > 0 {
-                        self.cycle_page(true)
-                    } else {
-                        Vec::new()
-                    };
+                let btn = ButtonRef::Cc { number: controller };
+                let is_press = value > 0;
+                if Some(btn) == self.next_page_button {
+                    return if is_press { self.handle_next_press(btn) } else { Vec::new() };
                 }
-                if self.is_button(ButtonRef::Cc { number: controller }, &self.page_down) {
-                    return if value > 0 {
-                        self.cycle_page(false)
+                if Some(btn) == self.previous_page_button {
+                    return if is_press { self.handle_previous_press(btn) } else { Vec::new() };
+                }
+                if let Some(slot) = self.page_button_slot(btn) {
+                    return if is_press {
+                        self.handle_page_button_press(slot, btn)
                     } else {
-                        Vec::new()
+                        self.handle_page_button_release(btn)
                     };
                 }
                 if !self.device.is_grid_cc(controller) {
@@ -174,6 +207,56 @@ impl Proxy {
             Msg::SysEx(_) | Msg::Other(_) => {
                 vec![self.to_host_current(bytes.to_vec())]
             }
+        }
+    }
+
+    fn page_button_slot(&self, btn: ButtonRef) -> Option<u8> {
+        self.page_buttons
+            .iter()
+            .position(|b| *b == btn)
+            .map(|i| i as u8)
+    }
+
+    fn handle_next_press(&mut self, btn: ButtonRef) -> Vec<Out> {
+        let mut out = self.flash_pulse(btn);
+        out.extend(self.cycle_persistent(true));
+        out
+    }
+
+    fn handle_previous_press(&mut self, btn: ButtonRef) -> Vec<Out> {
+        let mut out = self.flash_pulse(btn);
+        out.extend(self.cycle_persistent(false));
+        out
+    }
+
+    fn flash_pulse(&self, btn: ButtonRef) -> Vec<Out> {
+        let on = self.device.paint_button(btn, self.device.flash_color());
+        let off = self.device.clear_button(btn);
+        vec![
+            Out::ToDevice(on),
+            Out::DeviceDelayedSend {
+                delay_ms: 200,
+                bytes: off,
+            },
+        ]
+    }
+
+    fn handle_page_button_press(&mut self, slot: u8, btn: ButtonRef) -> Vec<Out> {
+        if slot >= self.pages {
+            return Vec::new();
+        }
+        if self.hold_to_preview {
+            self.enter_preview(slot, btn)
+        } else {
+            self.set_persistent_page(slot)
+        }
+    }
+
+    fn handle_page_button_release(&mut self, btn: ButtonRef) -> Vec<Out> {
+        if self.hold_to_preview && self.held_preview_button == Some(btn) {
+            self.exit_preview()
+        } else {
+            Vec::new()
         }
     }
 
@@ -358,30 +441,77 @@ impl Proxy {
     }
 
     /// True if `controller` is one of the CCs the proxy itself manages
-    /// (page-up, page-down, or any indicator LED). DAW writes to these are
+    /// (next/previous page, or any page button). DAW writes to these are
     /// fine to forward but caching them is pointless because
     /// `paint_indicators` will overwrite them on every page change anyway.
     fn is_proxy_managed_cc(&self, controller: u8) -> bool {
         let cc = ButtonRef::Cc { number: controller };
-        self.page_up == cc || self.page_down == cc || self.indicators.contains(&cc)
+        self.next_page_button == Some(cc)
+            || self.previous_page_button == Some(cc)
+            || self.page_buttons.contains(&cc)
     }
 
     // -- Page change --------------------------------------------------------
 
-    fn cycle_page(&mut self, up: bool) -> Vec<Out> {
-        let new_page = if up {
-            self.current_page
+    /// Move the persistent page forward/backward by one and update the
+    /// visible page if no preview is active. Used by next/prev buttons.
+    fn cycle_persistent(&mut self, forward: bool) -> Vec<Out> {
+        let new_page = if forward {
+            self.persistent_page
                 .saturating_add(1)
                 .min(self.pages.saturating_sub(1))
         } else {
-            self.current_page.saturating_sub(1)
+            self.persistent_page.saturating_sub(1)
         };
-        if new_page == self.current_page {
+        if new_page == self.persistent_page {
             return Vec::new();
         }
-        self.change_page_to(new_page)
+        self.set_persistent_page(new_page)
     }
 
+    /// Set the persistent page to `p`. If a preview is active, only the
+    /// stored persistent_page is updated (no visible change); otherwise
+    /// the grid is repainted to show the new page.
+    pub fn set_persistent_page(&mut self, p: u8) -> Vec<Out> {
+        if p >= self.pages {
+            return Vec::new();
+        }
+        self.persistent_page = p;
+        if self.held_preview.is_some() {
+            // Visible page is the preview; persistent move is silent.
+            return Vec::new();
+        }
+        self.change_page_to(p)
+    }
+
+    /// Mode C: enter preview of page `p` while `btn` is held. Visible page
+    /// becomes `p` until release.
+    fn enter_preview(&mut self, p: u8, btn: ButtonRef) -> Vec<Out> {
+        if p >= self.pages {
+            return Vec::new();
+        }
+        if self.held_preview == Some(p) {
+            return Vec::new();
+        }
+        self.held_preview = Some(p);
+        self.held_preview_button = Some(btn);
+        self.change_page_to(p)
+    }
+
+    /// Mode C: end preview, revert visible page to the persistent one.
+    fn exit_preview(&mut self) -> Vec<Out> {
+        if self.held_preview.is_none() {
+            return Vec::new();
+        }
+        self.held_preview = None;
+        self.held_preview_button = None;
+        self.change_page_to(self.persistent_page)
+    }
+
+    /// Internal page swap: synthesize note-offs for held pads on the OLD
+    /// visible page, swap, clear the device, replay cache, repaint
+    /// indicators. Public for tests that want to drive a specific page
+    /// without going through next/prev or page buttons.
     pub fn change_page_to(&mut self, new_page: u8) -> Vec<Out> {
         if new_page >= self.pages {
             return Vec::new();
@@ -418,7 +548,7 @@ impl Proxy {
         // 3. Replay cache for the new page.
         out.extend(self.replay_page_to_device());
         // 4. Update indicator LEDs.
-        for bytes in self.device.paint_indicators(new_page, &self.indicators) {
+        for bytes in self.device.paint_indicators(new_page, &self.page_buttons) {
             out.push(Out::ToDevice(bytes));
         }
         out
@@ -476,10 +606,6 @@ impl Proxy {
         }
     }
 
-    fn is_button(&self, b: ButtonRef, target: &ButtonRef) -> bool {
-        b == *target
-    }
-
     fn is_paged_logical_note(&self, note: u8) -> bool {
         let page = note / self.note_offset;
         let physical = note % self.note_offset;
@@ -521,9 +647,10 @@ mod tests {
             note_offset: Some(64),
             page_port_prefix: None,
             boot_sysex: None,
-            page_up_button: ButtonRef::Cc { number: 91 },
-            page_down_button: ButtonRef::Cc { number: 92 },
-            indicator_leds: vec![],
+            next_page_button: Some(ButtonRef::Cc { number: 91 }),
+            previous_page_button: Some(ButtonRef::Cc { number: 92 }),
+            page_buttons: vec![],
+            page_buttons_hold_to_preview: false,
         }
     }
 
@@ -547,9 +674,10 @@ mod tests {
             note_offset: Some(64),
             page_port_prefix: None,
             boot_sysex: None,
-            page_up_button: ButtonRef::Note { number: 98 },
-            page_down_button: ButtonRef::Note { number: 99 },
-            indicator_leds: vec![],
+            next_page_button: Some(ButtonRef::Note { number: 98 }),
+            previous_page_button: Some(ButtonRef::Note { number: 99 }),
+            page_buttons: vec![],
+            page_buttons_hold_to_preview: false,
         }
     }
 
@@ -623,12 +751,17 @@ mod tests {
     }
 
     #[test]
-    fn offset_page_up_at_max_is_noop() {
+    fn offset_next_at_max_is_page_noop_but_still_flashes() {
+        // Pressing next at the max page emits the flash feedback but does
+        // NOT move the page or emit any host-bound messages.
         let mut p = proxy_mini_offset(2);
-        p.change_page_to(1);
+        p.set_persistent_page(1);
         let out = p.handle_device_in(&parse::cc(0, 91, 127));
         assert_eq!(p.current_page, 1);
-        assert!(out.is_empty());
+        assert!(host_offset_bytes(&out).is_empty());
+        // Flash-on (device send) and delayed-clear are still present.
+        assert_eq!(device_bytes(&out).len(), 1);
+        assert_eq!(delayed_device_bytes(&out).len(), 1);
     }
 
     #[test]
@@ -795,18 +928,18 @@ mod tests {
 
     #[test]
     fn perport_host_cc_for_proxy_managed_button_is_not_cached() {
-        // Page-cycle and indicator CCs are managed by paint_indicators —
+        // Next/prev and page-button CCs are managed by paint_indicators —
         // caching DAW writes to them is pointless and would just be clobbered.
         let mut cfg = cfg_mini(4, Mode::PerPort);
-        cfg.indicator_leds = vec![ButtonRef::Cc { number: 89 }];
+        cfg.page_buttons = vec![ButtonRef::Cc { number: 89 }];
         let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
-        // page_up = CC 91 (per cfg_mini).
+        // next_page_button = CC 91 (per cfg_mini).
         let _ = p.handle_host_in_per_port(1, &parse::cc(0, 91, 100));
         assert!(!p.led_cache[1].contains_key(&CacheKey::Cc(91)));
-        // page_down = CC 92.
+        // previous_page_button = CC 92.
         let _ = p.handle_host_in_per_port(1, &parse::cc(0, 92, 100));
         assert!(!p.led_cache[1].contains_key(&CacheKey::Cc(92)));
-        // CC 89 is an indicator.
+        // CC 89 is a page button.
         let _ = p.handle_host_in_per_port(1, &parse::cc(0, 89, 100));
         assert!(!p.led_cache[1].contains_key(&CacheKey::Cc(89)));
         // A non-managed CC IS cached.
@@ -859,13 +992,183 @@ mod tests {
     }
 
     #[test]
-    fn perport_page_change_paints_indicators() {
+    fn perport_page_change_paints_page_button_indicators() {
         let mut cfg = cfg_mini(2, Mode::PerPort);
-        cfg.indicator_leds = vec![ButtonRef::Cc { number: 89 }, ButtonRef::Cc { number: 79 }];
+        cfg.page_buttons = vec![ButtonRef::Cc { number: 89 }, ButtonRef::Cc { number: 79 }];
         let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
         let out = p.change_page_to(1);
         let dev = device_bytes(&out);
         assert!(dev.iter().any(|b| b == &parse::cc(0, 79, 21).to_vec()));
         assert!(dev.iter().any(|b| b == &parse::cc(0, 89, 1).to_vec()));
+    }
+
+    // -- Mode A / B / C tests ----------------------------------------------
+
+    fn delayed_device_bytes(out: &[Out]) -> Vec<(u32, Vec<u8>)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::DeviceDelayedSend { delay_ms, bytes } => Some((*delay_ms, bytes.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn next_prev_emits_flash_then_delayed_clear() {
+        // Press next_page_button (CC 91 on the Mini) -> immediate flash-on
+        // and a delayed flash-off, plus the page-change side effects.
+        let mut p = proxy_mini_perport(4);
+        let out = p.handle_device_in(&parse::cc(0, 91, 127));
+        let dev = device_bytes(&out);
+        // First device write should be the flash-on at flash color (21 for Mini MK3).
+        assert_eq!(dev.first(), Some(&parse::cc(0, 91, 21).to_vec()));
+        let delayed = delayed_device_bytes(&out);
+        assert_eq!(delayed.len(), 1);
+        assert_eq!(delayed[0], (200, parse::cc(0, 91, 0).to_vec()));
+        assert_eq!(p.persistent_page, 1);
+        assert_eq!(p.current_page, 1);
+    }
+
+    #[test]
+    fn page_button_tap_jumps_to_page_in_mode_b() {
+        // Mode B: page_buttons configured, hold_to_preview = false.
+        let mut cfg = cfg_mini(4, Mode::PerPort);
+        cfg.page_buttons = vec![
+            ButtonRef::Cc { number: 89 },
+            ButtonRef::Cc { number: 79 },
+            ButtonRef::Cc { number: 69 },
+            ButtonRef::Cc { number: 59 },
+        ];
+        let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
+        // Tap the third page button (slot 2 -> page 2).
+        let _ = p.handle_device_in(&parse::cc(0, 69, 127));
+        assert_eq!(p.persistent_page, 2);
+        assert_eq!(p.current_page, 2);
+        // Release does nothing in Mode B.
+        let out = p.handle_device_in(&parse::cc(0, 69, 0));
+        assert!(out.is_empty());
+        assert_eq!(p.current_page, 2);
+    }
+
+    #[test]
+    fn hold_preview_press_changes_visible_page() {
+        let mut cfg = cfg_mini(4, Mode::PerPort);
+        cfg.page_buttons = vec![
+            ButtonRef::Cc { number: 89 },
+            ButtonRef::Cc { number: 79 },
+            ButtonRef::Cc { number: 69 },
+            ButtonRef::Cc { number: 59 },
+        ];
+        cfg.page_buttons_hold_to_preview = true;
+        let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
+        // Hold slot 2 -> visible page becomes 2; persistent stays 0.
+        let _ = p.handle_device_in(&parse::cc(0, 69, 127));
+        assert_eq!(p.current_page, 2);
+        assert_eq!(p.persistent_page, 0);
+        assert_eq!(p.held_preview, Some(2));
+    }
+
+    #[test]
+    fn hold_preview_release_reverts_to_persistent() {
+        let mut cfg = cfg_mini(4, Mode::PerPort);
+        cfg.page_buttons = vec![
+            ButtonRef::Cc { number: 89 },
+            ButtonRef::Cc { number: 79 },
+            ButtonRef::Cc { number: 69 },
+            ButtonRef::Cc { number: 59 },
+        ];
+        cfg.page_buttons_hold_to_preview = true;
+        let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
+        // Move persistent first.
+        let _ = p.handle_device_in(&parse::cc(0, 91, 127)); // next -> page 1
+        assert_eq!(p.persistent_page, 1);
+        assert_eq!(p.current_page, 1);
+        // Hold slot 3 -> preview page 3.
+        let _ = p.handle_device_in(&parse::cc(0, 59, 127));
+        assert_eq!(p.current_page, 3);
+        assert_eq!(p.persistent_page, 1);
+        // Release -> revert to persistent (page 1).
+        let _ = p.handle_device_in(&parse::cc(0, 59, 0));
+        assert_eq!(p.current_page, 1);
+        assert_eq!(p.persistent_page, 1);
+        assert_eq!(p.held_preview, None);
+    }
+
+    #[test]
+    fn hold_preview_grid_press_routes_to_previewed_page() {
+        // The killer test: while holding a page button, grid presses must
+        // route to the previewed page, not the persistent one.
+        let mut cfg = cfg_apc(4, Mode::PerPort);
+        cfg.page_buttons = vec![
+            ButtonRef::Note { number: 82 },
+            ButtonRef::Note { number: 83 },
+            ButtonRef::Note { number: 84 },
+            ButtonRef::Note { number: 85 },
+        ];
+        cfg.page_buttons_hold_to_preview = true;
+        let mut p = Proxy::new(&cfg, Box::new(ApcMini));
+        // Persistent = 0. Hold page button slot 2.
+        let _ = p.handle_device_in(&parse::note_on(0, 84, 127));
+        assert_eq!(p.current_page, 2);
+        // Press grid pad 5 -> must go to ToHostPage(page=2).
+        let out = p.handle_device_in(&parse::note_on(0, 5, 100));
+        assert_eq!(
+            host_page_outs(&out),
+            vec![(2, parse::note_on(0, 5, 100).to_vec())]
+        );
+        // Release page button -> revert. Grid pad 5 is now held on page 2;
+        // the revert should synthesize a note-off on page 2.
+        let out = p.handle_device_in(&parse::note_on(0, 84, 0));
+        let host = host_page_outs(&out);
+        assert!(
+            host.iter()
+                .any(|(page, b)| *page == 2 && b == &parse::note_off(0, 5, 0).to_vec()),
+            "expected ToHostPage(page=2, NoteOff(5)) on revert, got {host:?}",
+        );
+        assert_eq!(p.current_page, 0);
+    }
+
+    #[test]
+    fn hold_mode_tap_does_not_change_persistent_page() {
+        // In Mode C, tap-then-release of a page button must not move the
+        // persistent page (only next/prev does).
+        let mut cfg = cfg_mini(4, Mode::PerPort);
+        cfg.page_buttons = vec![
+            ButtonRef::Cc { number: 89 },
+            ButtonRef::Cc { number: 79 },
+            ButtonRef::Cc { number: 69 },
+            ButtonRef::Cc { number: 59 },
+        ];
+        cfg.page_buttons_hold_to_preview = true;
+        let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
+        // Tap (press + release) slot 2.
+        let _ = p.handle_device_in(&parse::cc(0, 69, 127));
+        let _ = p.handle_device_in(&parse::cc(0, 69, 0));
+        assert_eq!(p.persistent_page, 0, "persistent must stay at 0 after tap");
+        assert_eq!(p.current_page, 0);
+    }
+
+    #[test]
+    fn next_prev_still_works_when_in_preview() {
+        let mut cfg = cfg_mini(4, Mode::PerPort);
+        cfg.page_buttons = vec![
+            ButtonRef::Cc { number: 89 },
+            ButtonRef::Cc { number: 79 },
+            ButtonRef::Cc { number: 69 },
+            ButtonRef::Cc { number: 59 },
+        ];
+        cfg.page_buttons_hold_to_preview = true;
+        let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
+        // Hold slot 3 -> preview page 3.
+        let _ = p.handle_device_in(&parse::cc(0, 59, 127));
+        assert_eq!(p.current_page, 3);
+        assert_eq!(p.persistent_page, 0);
+        // Press next -> persistent moves but visible page stays at preview.
+        let _ = p.handle_device_in(&parse::cc(0, 91, 127));
+        assert_eq!(p.persistent_page, 1);
+        assert_eq!(p.current_page, 3);
+        // Release preview -> revert to (newly moved) persistent = page 1.
+        let _ = p.handle_device_in(&parse::cc(0, 59, 0));
+        assert_eq!(p.current_page, 1);
     }
 }
