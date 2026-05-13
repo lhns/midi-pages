@@ -58,6 +58,23 @@ pub fn open_input(client: &str, needle: &str) -> Result<(MidiInput, MidiInputPor
     Ok((mi, port))
 }
 
+/// Cheap presence check: open a transient `MidiOutput`, list ports, return
+/// true iff at least one name contains `needle`. No `connect` happens here,
+/// so this is safe to call from a poll thread once per second. Errors when
+/// the OS-side `MidiOutput::new` itself fails (mid-disconnect this can
+/// transiently fail; callers should treat that as "unknown" rather than
+/// definitive absence).
+pub fn port_present(client: &str, needle: &str) -> Result<bool> {
+    let mo = MidiOutput::new(client).context("MidiOutput::new (port_present)")?;
+    for port in mo.ports() {
+        let name = mo.port_name(&port).unwrap_or_default();
+        if name.contains(needle) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn open_output_named(client: &str, needle: &str) -> Result<midir::MidiOutputConnection> {
     let mo = MidiOutput::new(client).context("create MidiOutput")?;
     let port = find_output(&mo, needle)?;

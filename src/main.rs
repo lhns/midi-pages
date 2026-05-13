@@ -207,6 +207,58 @@ fn wait_for_shutdown() {
     }
 }
 
+/// Spawn a per-device polling thread that logs whenever the physical port
+/// transitions from present to absent or back. Edge-triggered (only logs on
+/// change) so steady-state runs are silent. Exits when `SHUTDOWN` flips.
+///
+/// The thread handle is dropped: the watchdog dies on its own via the
+/// SHUTDOWN check on the next `park_timeout` wake-up (within ~1s).
+fn spawn_presence_watchdog(device_name: String, needle: String) {
+    let _ = thread::Builder::new()
+        .name(format!("midi-pages:{device_name}:presence"))
+        .spawn(move || {
+            let client = format!("midi-pages-{device_name}-presence");
+            let mut last_present: Option<bool> = None;
+            while !SHUTDOWN.load(Ordering::SeqCst) {
+                match ports::port_present(&client, &needle) {
+                    Ok(present) => {
+                        if last_present != Some(present) {
+                            if last_present.is_none() {
+                                info!(
+                                    device = %device_name,
+                                    port = %needle,
+                                    present,
+                                    "device port presence (initial)"
+                                );
+                            } else if present {
+                                info!(
+                                    device = %device_name,
+                                    port = %needle,
+                                    "device port back"
+                                );
+                            } else {
+                                warn!(
+                                    device = %device_name,
+                                    port = %needle,
+                                    "device port gone"
+                                );
+                            }
+                            last_present = Some(present);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            device = %device_name,
+                            port = %needle,
+                            "presence probe failed: {e}"
+                        );
+                    }
+                }
+                thread::park_timeout(Duration::from_secs(1));
+            }
+        });
+}
+
 fn make_device(driver: Driver) -> Box<dyn Device> {
     match driver {
         Driver::MiniMk3 => Box::new(MiniMk3),
@@ -218,6 +270,11 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
     info!(device = %cfg.name, "run_device: start");
     let device = make_device(cfg.driver);
     let proxy = Arc::new(Mutex::new(Proxy::new(cfg, device)));
+
+    // Diagnostics: 1-second port-presence poll so we get an info-level log
+    // whenever the physical device disappears or reappears. Watchdog thread
+    // exits on SHUTDOWN within ~1s of the flag flipping.
+    spawn_presence_watchdog(cfg.name.clone(), cfg.port_match.output().to_string());
 
     info!(device = %cfg.name, port_match = %cfg.port_match, "opening real device output");
     // Open device side (real USB MIDI) — the same in either mode.
@@ -395,7 +452,7 @@ fn dispatch_offset_windows(
             }
             Out::ToDevice(b) => {
                 if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!("device send: {e}");
+                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
                 }
             }
             Out::ToHostPage { .. } => {
@@ -423,7 +480,7 @@ fn dispatch_per_port_windows(
             }
             Out::ToDevice(b) => {
                 if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!("device send: {e}");
+                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
                 }
             }
             Out::ToHost(_) => {
@@ -589,7 +646,7 @@ fn dispatch_offset(
             }
             Out::ToDevice(b) => {
                 if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!("device send: {e}");
+                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
                 }
             }
             Out::ToHostPage { .. } => {
@@ -616,7 +673,7 @@ fn dispatch_per_port(
             }
             Out::ToDevice(b) => {
                 if let Err(e) = device_out.lock().unwrap().send(b) {
-                    warn!("device send: {e}");
+                    warn!(kind = "device-send", bytes = b.len(), "send failed: {e}");
                 }
             }
             Out::ToHost(_) => {
