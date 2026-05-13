@@ -105,6 +105,8 @@ mod windows_host {
         _device: MidiVirtualDevice,
         _plugin: IMidiEndpointMessageProcessingPlugin,
         sender: MidiEndpointConnection,
+        plugin_id: GUID,
+        connection_id: GUID,
     }
 
     unsafe impl Send for WindowsHostPort {}
@@ -112,18 +114,25 @@ mod windows_host {
 
     impl Drop for WindowsHostPort {
         fn drop(&mut self) {
-            // Explicitly tell WMS to tear down before our smart-pointer fields
-            // get released by `IUnknown::Release`. Without this the process can
-            // exit before midisrv has fully processed the reference drops,
-            // leaking the Virtual Device registration and progressively wedging
-            // the MIDI subsystem until reboot.
-            //
-            // `MidiSession::Close` closes all owned endpoint connections too,
-            // so we don't need a separate close on `_connection` / `sender`.
-            // `MidiVirtualDevice::Cleanup` is the plugin-interface teardown
-            // hook documented on the device. Errors here are best-effort.
+            // Each step logged at info so the smoke run terminal shows
+            // exactly how far Drop got before any hang. If a call blocks
+            // midisrv, the last "step" line will be the previous step.
+            info!("Drop chain begin");
+            let _ = self._device.SetIsEnabled(false);
+            info!(step = "SetIsEnabled(false)", "Drop");
+            let _ = self
+                ._connection
+                .RemoveMessageProcessingPlugin(self.plugin_id);
+            info!(step = "RemoveMessageProcessingPlugin", "Drop");
             let _ = self._device.Cleanup();
+            info!(step = "Cleanup", "Drop");
+            let _ = self
+                ._session
+                .DisconnectEndpointConnection(self.connection_id);
+            info!(step = "DisconnectEndpointConnection", "Drop");
             let _ = self._session.Close();
+            info!(step = "Session.Close", "Drop");
+            info!("Drop chain end");
         }
     }
 
@@ -137,9 +146,18 @@ mod windows_host {
         {
             ensure_wms_dll_loaded()?;
 
-            // Stable per-name ProductInstanceId so reruns of midi-pages reuse
-            // the same logical device identity.
-            let product_id = format!("midi-pages.{}", unique_id_for(name));
+            // Per-process ProductInstanceId. Stable IDs caused midisrv's WinMM
+            // bridge to stop propagating recreations after the first cycle:
+            // the WMS device was created server-side OK, but the WinMM
+            // enumeration never picked it up, so DasLight (which goes through
+            // the WinMM API) saw no device. Including the PID makes each run
+            // a brand-new device from midisrv's point of view; the friendly
+            // Name stays stable so DasLight bindings still match.
+            let product_id = format!(
+                "midi-pages.{}.{}",
+                unique_id_for(name),
+                std::process::id()
+            );
             let info = MidiDeclaredEndpointInfo {
                 Name: HSTRING::from(name),
                 ProductInstanceId: HSTRING::from(product_id.as_str()),
@@ -177,11 +195,12 @@ mod windows_host {
                 .CreateEndpointConnection(&dev_id)
                 .map_err(|e| anyhow!("CreateEndpointConnection: {e}"))?;
 
+            let plugin_id = GUID::from_u128(
+                0xb1d10001_0000_4000_8000_000000000000
+                    ^ u128::from(fnv1a64(name.as_bytes())),
+            );
             let plugin_obj = PluginShim {
-                plugin_id: GUID::from_u128(
-                    0xb1d10001_0000_4000_8000_000000000000
-                        ^ u128::from(fnv1a64(name.as_bytes())),
-                ),
+                plugin_id,
                 plugin_name: Mutex::new(HSTRING::from(format!("midi-pages plugin for {name}"))),
                 plugin_tag: Mutex::new(None),
                 is_enabled: Mutex::new(true),
@@ -202,6 +221,10 @@ mod windows_host {
                 ));
             }
 
+            let connection_id = connection
+                .ConnectionId()
+                .map_err(|e| anyhow!("ConnectionId: {e}"))?;
+
             // Wait for the externally-visible endpoint to appear in WinMM
             // enumeration so downstream `find_*` calls would succeed; midisrv
             // can be slow when several endpoints are created in succession.
@@ -213,6 +236,8 @@ mod windows_host {
                 _session: session,
                 _device: device,
                 _plugin: plugin,
+                plugin_id,
+                connection_id,
             })
         }
 

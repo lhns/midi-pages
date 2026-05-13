@@ -32,6 +32,17 @@ struct Args {
     config: PathBuf,
     #[arg(long)]
     list_ports: bool,
+    /// Open all configured Windows host ports, sleep briefly, drop them, exit.
+    /// Used to validate the Drop chain without booting DasLight. After running
+    /// this, `--list-ports` should return promptly with no surviving
+    /// `*-page*` endpoints. Windows-only and no-op on other platforms.
+    #[arg(long)]
+    shutdown_smoke: bool,
+    /// Spawn an elevated PowerShell to `Restart-Service midisrv`. Recovery
+    /// escape hatch when midisrv has wedged despite our cleanup chain.
+    /// Pops a UAC prompt; we do not auto-elevate silently.
+    #[arg(long)]
+    restart_midisrv: bool,
 }
 
 fn main() -> Result<()> {
@@ -59,8 +70,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.restart_midisrv {
+        return restart_midisrv();
+    }
+
     let cfg = Config::load(&args.config)
         .with_context(|| format!("load config {}", args.config.display()))?;
+
+    if args.shutdown_smoke {
+        return shutdown_smoke(&cfg);
+    }
 
     info!("loaded {} device profile(s)", cfg.devices.len());
 
@@ -282,20 +301,35 @@ fn run_per_port(
     let host_ports: Arc<Mutex<Vec<Option<ports::WindowsHostPort>>>> =
         Arc::new(Mutex::new((0..pages as usize).map(|_| None).collect()));
 
-    for (page_idx, host_name) in port_names.iter().enumerate() {
-        let p = Arc::clone(&proxy);
-        let host_ports_for_cb = Arc::clone(&host_ports);
-        let device_out_for_cb = Arc::clone(&device_out);
-        let page = page_idx as u8;
-        let port = ports::WindowsHostPort::create(host_name, move |msg| {
-            let outs = {
-                let mut p = p.lock().unwrap();
-                p.handle_host_in_per_port(page, msg)
-            };
-            dispatch_per_port_windows(&outs, &host_ports_for_cb, &device_out_for_cb);
-        })?;
-        host_ports.lock().unwrap()[page_idx] = Some(port);
-    }
+    // Create all page endpoints in parallel. Each `WindowsHostPort::create`
+    // spends ~5 s polling midisrv's WinMM bridge for the new endpoint to
+    // appear in enumeration; running them concurrently turns ~pages × 5 s
+    // into roughly max(per-port) instead of the sum.
+    thread::scope(|s| -> Result<()> {
+        let mut handles = Vec::with_capacity(port_names.len());
+        for (page_idx, host_name) in port_names.iter().enumerate() {
+            let p = Arc::clone(&proxy);
+            let host_ports_for_cb = Arc::clone(&host_ports);
+            let device_out_for_cb = Arc::clone(&device_out);
+            let host_ports_insert = Arc::clone(&host_ports);
+            let page = page_idx as u8;
+            handles.push(s.spawn(move || -> Result<()> {
+                let port = ports::WindowsHostPort::create(host_name, move |msg| {
+                    let outs = {
+                        let mut p = p.lock().unwrap();
+                        p.handle_host_in_per_port(page, msg)
+                    };
+                    dispatch_per_port_windows(&outs, &host_ports_for_cb, &device_out_for_cb);
+                })?;
+                host_ports_insert.lock().unwrap()[page_idx] = Some(port);
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| anyhow!("host port creation thread panicked"))??;
+        }
+        Ok(())
+    })?;
 
     // Device -> proxy -> currently-active host port.
     let p_dev = Arc::clone(&proxy);
@@ -597,6 +631,73 @@ where
     Err(anyhow!(
         "no MIDI input port matching `{needle}` and virtual creation not allowed here"
     ))
+}
+
+// =========================================================================
+// Recovery / smoke-test subcommands.
+// =========================================================================
+
+#[cfg(target_os = "windows")]
+fn shutdown_smoke(cfg: &Config) -> Result<()> {
+    info!("shutdown_smoke: opening all configured host ports");
+    let mut ports = Vec::new();
+    for d in &cfg.devices {
+        match d.mode {
+            Mode::PerPort => {
+                for name in d.page_port_names() {
+                    info!(port = %name, "open");
+                    ports.push(ports::WindowsHostPort::create(&name, |_| {})?);
+                }
+            }
+            Mode::NoteOffset => {
+                if let Some(name) = d.host_port_in.as_deref() {
+                    info!(port = %name, "open");
+                    ports.push(ports::WindowsHostPort::create(name, |_| {})?);
+                }
+            }
+        }
+    }
+    info!(count = ports.len(), "opened; settling 500 ms");
+    thread::sleep(Duration::from_millis(500));
+    info!("dropping all ports (exercises Drop chain)");
+    drop(ports);
+    info!("dropped; waiting 500 ms for midisrv to settle");
+    thread::sleep(Duration::from_millis(500));
+    info!("shutdown_smoke complete; now run --list-ports to confirm no ghosts");
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shutdown_smoke(_cfg: &Config) -> Result<()> {
+    info!("shutdown_smoke is a no-op on non-Windows platforms");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn restart_midisrv() -> Result<()> {
+    info!("spawning elevated PowerShell to restart midisrv (accept the UAC prompt)");
+    // Start-Process -Verb RunAs triggers the UAC prompt; the inner command
+    // calls Restart-Service. We do NOT silently elevate or Stop-Process the
+    // service from this process — the user explicitly clicks Allow.
+    let status = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-Command','Restart-Service midisrv'",
+        ])
+        .status()
+        .context("spawn powershell.exe")?;
+    if !status.success() {
+        return Err(anyhow!("powershell exited with {status}"));
+    }
+    info!("UAC dispatched. Once midisrv has restarted, re-run midi-pages normally.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restart_midisrv() -> Result<()> {
+    Err(anyhow!("--restart-midisrv is Windows-only"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
