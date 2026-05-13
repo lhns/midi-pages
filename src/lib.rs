@@ -6,4 +6,7 @@ pub mod ports;
 pub mod proxy;
 
 #[cfg(target_os = "windows")]
+pub mod shutdown;
+
+#[cfg(target_os = "windows")]
 pub mod wms_bindings;
