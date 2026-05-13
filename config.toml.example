@@ -37,6 +37,15 @@
 #       interactive: pressing other pads with another finger fires on
 #       the previewed page. Releasing reverts to the persistent page.
 #       The persistent page is moved only via next/previous_page_button.
+#
+# Multiple `[[device]]` blocks are supported and run side by side in a
+# single process. Each device gets its own page-navigation state, virtual
+# host ports, reconnect supervisor, and presence watchdog. The proxy can
+# also start with one or more physical devices missing — the supervisor
+# keeps retrying and picks them up the moment they're plugged in.
+# Registration runs in strict config-declaration order across devices, so
+# WinMM device-index assignments stay stable across runs (important for
+# host apps like DasLight that persist MIDI bindings by index).
 
 [[device]]
 name             = "Launchpad Mini MK3"

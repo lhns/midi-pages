@@ -1,8 +1,19 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
+
+/// Cross-device registration gate: a counter shared by all per-device
+/// worker threads. Each worker waits until the counter matches its
+/// declaration index before registering its host-side endpoints, and
+/// bumps the counter when finished. The result: WMS Virtual Device
+/// registration runs in strict config-declaration order across devices,
+/// midisrv assigns WinMM indices in that order, and DasLight bindings
+/// (which persist by index) stay stable across runs. Phase 2 of the
+/// startup (wait_for_ports, supervisor, etc.) still runs fully in
+/// parallel — the gate only serializes the fast registration step.
+type RegisterGate = Arc<(Mutex<usize>, Condvar)>;
 
 /// Global shutdown flag set by the Ctrl-C handler. Per-device worker threads
 /// poll this and return cleanly so their stack-allocated WMS resources (the
@@ -157,12 +168,18 @@ fn main() -> Result<()> {
 
     info!("loaded {} device profile(s)", cfg.devices.len());
 
+    // Cross-device registration gate: ensures WMS Virtual Device names
+    // register in strict config-declaration order across devices, even
+    // though everything downstream runs in parallel. See RegisterGate.
+    let register_gate: RegisterGate = Arc::new((Mutex::new(0usize), Condvar::new()));
+
     let mut handles = Vec::new();
-    for d in cfg.devices {
+    for (idx, d) in cfg.devices.into_iter().enumerate() {
+        let gate = Arc::clone(&register_gate);
         let h = thread::Builder::new()
             .name(format!("midi-pages:{}", d.name))
             .spawn(move || {
-                if let Err(e) = run_device(&d) {
+                if let Err(e) = run_device(&d, idx, gate) {
                     error!(device = %d.name, error = %e, "device thread exited");
                 }
             })?;
@@ -352,6 +369,38 @@ fn settle_midisrv(device_name: &str, port_names: &[&str]) {
     info!(device = %device_name, "shutdown complete");
 }
 
+/// RAII guard for the cross-device registration gate. Acquired via
+/// `await_register_turn`; releases the next device's slot when dropped.
+struct RegisterTurn<'a> {
+    gate: &'a (Mutex<usize>, Condvar),
+    device_idx: usize,
+}
+
+impl Drop for RegisterTurn<'_> {
+    fn drop(&mut self) {
+        let (lock, cvar) = self.gate;
+        *lock.lock().unwrap() = self.device_idx + 1;
+        cvar.notify_all();
+    }
+}
+
+/// Block until it's `device_idx`'s turn to register. Returns a guard that
+/// releases the next device on drop. Honours `SHUTDOWN` so a Ctrl-C during
+/// the very first registration cycle still tears down promptly.
+fn await_register_turn(gate: &RegisterGate, device_idx: usize) -> Option<RegisterTurn<'_>> {
+    let (lock, cvar) = &**gate;
+    let mut next = lock.lock().unwrap();
+    while *next != device_idx {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return None;
+        }
+        // Wake periodically as a safety belt for SHUTDOWN.
+        let (n, _) = cvar.wait_timeout(next, Duration::from_millis(250)).unwrap();
+        next = n;
+    }
+    Some(RegisterTurn { gate, device_idx })
+}
+
 fn make_device(driver: Driver) -> Box<dyn Device> {
     match driver {
         Driver::MiniMk3 => Box::new(MiniMk3),
@@ -359,8 +408,8 @@ fn make_device(driver: Driver) -> Box<dyn Device> {
     }
 }
 
-fn run_device(cfg: &DeviceConfig) -> Result<()> {
-    info!(device = %cfg.name, "run_device: start");
+fn run_device(cfg: &DeviceConfig, device_idx: usize, register_gate: RegisterGate) -> Result<()> {
+    info!(device = %cfg.name, idx = device_idx, "run_device: start");
     let device = make_device(cfg.driver);
     let proxy = Arc::new(Mutex::new(Proxy::new(cfg, device)));
 
@@ -369,13 +418,12 @@ fn run_device(cfg: &DeviceConfig) -> Result<()> {
     spawn_presence_watchdog(cfg.name.clone(), cfg.port_match.output().to_string());
 
     // Shared device-link. The mode-specific runner does the initial connect
-    // (so startup fails fast if the device isn't there yet, matching prior
-    // behaviour) and spawns a supervisor that handles unplug + replug.
+    // and spawns a supervisor that handles unplug + replug.
     let link = Arc::new(DeviceLink::new());
 
     match cfg.mode {
-        Mode::NoteOffset => run_note_offset(cfg, proxy, link),
-        Mode::PerPort => run_per_port(cfg, proxy, link),
+        Mode::NoteOffset => run_note_offset(cfg, proxy, link, device_idx, register_gate),
+        Mode::PerPort => run_per_port(cfg, proxy, link, device_idx, register_gate),
     }
 }
 
@@ -567,6 +615,8 @@ fn run_note_offset(
     cfg: &DeviceConfig,
     proxy: Arc<Mutex<Proxy>>,
     link: Arc<DeviceLink>,
+    device_idx: usize,
+    register_gate: RegisterGate,
 ) -> Result<()> {
     let host_name = cfg
         .host_port_in
@@ -576,22 +626,28 @@ fn run_note_offset(
     // Host side: ONE Virtual Device endpoint, plugin callback feeds the proxy.
     // Two-phase: register (synchronous WinRT), wait for WinMM visibility,
     // then install. With a single port there's no order question, but the
-    // shape stays consistent with run_per_port.
+    // cross-device register gate still enforces declaration order across
+    // multiple devices.
     let host_port: Arc<Mutex<Option<ports::WindowsHostPort>>> = Arc::new(Mutex::new(None));
-    {
+    let pending = {
+        let _turn = await_register_turn(&register_gate, device_idx);
+        if _turn.is_none() {
+            return Ok(()); // shutdown during gate
+        }
         let p_host = Arc::clone(&proxy);
         let host_port_for_cb = Arc::clone(&host_port);
         let link_for_cb = Arc::clone(&link);
-        let pending = ports::PendingHostPort::register(host_name, move |msg| {
+        ports::PendingHostPort::register(host_name, move |msg| {
             let outs = {
                 let mut p = p_host.lock().unwrap();
                 p.handle_host_in(msg)
             };
             dispatch_offset_windows(&outs, &host_port_for_cb, &link_for_cb);
-        })?;
-        ports::wait_for_ports(&[host_name], Duration::from_secs(20))?;
-        *host_port.lock().unwrap() = Some(pending.into_ready());
-    }
+        })?
+        // _turn drops here, releasing the next device.
+    };
+    ports::wait_for_ports(&[host_name], Duration::from_secs(20))?;
+    *host_port.lock().unwrap() = Some(pending.into_ready());
 
     // Device-side callback factory. Used both for the initial connect and
     // by the supervisor on every reconnect. `first_seen` is shared across
@@ -623,9 +679,17 @@ fn run_note_offset(
         }
     };
 
-    // Initial connect (fail-fast at startup if the device isn't there).
+    // Initial connect. Soft-fail: if the physical device isn't reachable
+    // yet, let the supervisor pick up with its retry loop. The proxy's
+    // host-side virtual ports are already created so DasLight can bind.
     let cb = make_cb();
-    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+    if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
+        warn!(
+            device = %cfg.name,
+            error = %e,
+            "physical device not reachable at startup; supervisor will keep retrying"
+        );
+    }
 
     spawn_supervisor(
         cfg.name.clone(),
@@ -652,7 +716,13 @@ fn run_note_offset(
 }
 
 #[cfg(target_os = "windows")]
-fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLink>) -> Result<()> {
+fn run_per_port(
+    cfg: &DeviceConfig,
+    proxy: Arc<Mutex<Proxy>>,
+    link: Arc<DeviceLink>,
+    device_idx: usize,
+    register_gate: RegisterGate,
+) -> Result<()> {
     let pages = cfg.pages;
     let port_names = cfg.page_port_names();
 
@@ -666,24 +736,33 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
     // gives midisrv the CreateVirtualDevice calls back-to-back so the WinMM
     // device-index assignments come out in page order (DasLight persists
     // its MIDI bindings by index, so this stability matters across runs).
-    // Phase 2 then does a single combined wait until every registered
-    // endpoint is visible in WinMM enumeration; the per-port ~5 s
-    // visibility latency is shared, not serialized.
-    let mut pending: Vec<(usize, ports::PendingHostPort)> = Vec::with_capacity(port_names.len());
-    for (page_idx, host_name) in port_names.iter().enumerate() {
-        let p = Arc::clone(&proxy);
-        let host_ports_for_cb = Arc::clone(&host_ports);
-        let link_for_cb = Arc::clone(&link);
-        let page = page_idx as u8;
-        let pending_port = ports::PendingHostPort::register(host_name, move |msg| {
-            let outs = {
-                let mut p = p.lock().unwrap();
-                p.handle_host_in_per_port(page, msg)
-            };
-            dispatch_per_port_windows(&outs, &host_ports_for_cb, &link_for_cb);
-        })?;
-        pending.push((page_idx, pending_port));
-    }
+    // The cross-device register gate ensures multiple [[device]] entries
+    // also register in declaration order, so WinMM indices stay stable
+    // across the full configured fleet. Phase 2 (the slow visibility wait
+    // and everything downstream) runs in parallel across devices.
+    let pending: Vec<(usize, ports::PendingHostPort)> = {
+        let _turn = match await_register_turn(&register_gate, device_idx) {
+            Some(t) => t,
+            None => return Ok(()), // shutdown while waiting
+        };
+        let mut pending = Vec::with_capacity(port_names.len());
+        for (page_idx, host_name) in port_names.iter().enumerate() {
+            let p = Arc::clone(&proxy);
+            let host_ports_for_cb = Arc::clone(&host_ports);
+            let link_for_cb = Arc::clone(&link);
+            let page = page_idx as u8;
+            let pending_port = ports::PendingHostPort::register(host_name, move |msg| {
+                let outs = {
+                    let mut p = p.lock().unwrap();
+                    p.handle_host_in_per_port(page, msg)
+                };
+                dispatch_per_port_windows(&outs, &host_ports_for_cb, &link_for_cb);
+            })?;
+            pending.push((page_idx, pending_port));
+        }
+        pending
+        // _turn drops here, releasing the next device's registration.
+    };
 
     let name_refs: Vec<&str> = port_names.iter().map(String::as_str).collect();
     ports::wait_for_ports(&name_refs, Duration::from_secs(20))?;
@@ -724,9 +803,16 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
         }
     };
 
-    // Initial connect (fail-fast at startup).
+    // Initial connect. Soft-fail: supervisor will keep retrying if the
+    // physical device isn't reachable yet.
     let cb = make_cb();
-    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+    if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
+        warn!(
+            device = %cfg.name,
+            error = %e,
+            "physical device not reachable at startup; supervisor will keep retrying"
+        );
+    }
 
     spawn_supervisor(
         cfg.name.clone(),
@@ -841,6 +927,8 @@ fn run_note_offset(
     cfg: &DeviceConfig,
     proxy: Arc<Mutex<Proxy>>,
     link: Arc<DeviceLink>,
+    device_idx: usize,
+    register_gate: RegisterGate,
 ) -> Result<()> {
     let host_in_name = cfg
         .host_port_in
@@ -851,9 +939,20 @@ fn run_note_offset(
         .as_deref()
         .ok_or_else(|| anyhow!("note_offset mode requires host_port_out"))?;
 
-    let host_out: Arc<Mutex<midir::MidiOutputConnection>> = Arc::new(Mutex::new(
-        open_or_virtual_output(&format!("midi-pages-{}-host-out", cfg.name), host_out_name)?,
-    ));
+    // Cross-device register gate: midir's virtual-port creation assigns
+    // IDs in call order; serializing across devices keeps that ordering
+    // deterministic the same way it does on Windows/midisrv. The gate
+    // covers the output side only; the input side registers right after,
+    // outside the gate (input ordering is rarely what host apps persist).
+    let host_out: Arc<Mutex<midir::MidiOutputConnection>> = {
+        let _turn = match await_register_turn(&register_gate, device_idx) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let conn =
+            open_or_virtual_output(&format!("midi-pages-{}-host-out", cfg.name), host_out_name)?;
+        Arc::new(Mutex::new(conn))
+    };
 
     let p_host = Arc::clone(&proxy);
     let host_out_host = Arc::clone(&host_out);
@@ -897,7 +996,13 @@ fn run_note_offset(
     };
 
     let cb = make_cb();
-    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+    if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
+        warn!(
+            device = %cfg.name,
+            error = %e,
+            "physical device not reachable at startup; supervisor will keep retrying"
+        );
+    }
 
     spawn_supervisor(
         cfg.name.clone(),
@@ -914,22 +1019,35 @@ fn run_note_offset(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLink>) -> Result<()> {
+fn run_per_port(
+    cfg: &DeviceConfig,
+    proxy: Arc<Mutex<Proxy>>,
+    link: Arc<DeviceLink>,
+    device_idx: usize,
+    register_gate: RegisterGate,
+) -> Result<()> {
     let pages = cfg.pages;
     let port_names = cfg.page_port_names();
 
-    // Each page exposes ONE virtual port name. midir on Unix creates separate
-    // input + output sub-ports under the same name (the DAW sees one device
-    // with both directions).
-    let mut host_outs: Vec<Arc<Mutex<midir::MidiOutputConnection>>> = Vec::new();
-    for (page_idx, name) in port_names.iter().enumerate() {
-        let conn = open_or_virtual_output(
-            &format!("midi-pages-{}-page{}-out", cfg.name, page_idx + 1),
-            name,
-        )?;
-        host_outs.push(Arc::new(Mutex::new(conn)));
-    }
-    let host_outs = Arc::new(host_outs);
+    // Each page exposes ONE virtual port name. midir on Unix creates
+    // separate input + output sub-ports under the same name. The
+    // cross-device gate serialises virtual-port registration across
+    // devices so IDs come out in declaration order.
+    let host_outs: Arc<Vec<Arc<Mutex<midir::MidiOutputConnection>>>> = {
+        let _turn = match await_register_turn(&register_gate, device_idx) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let mut outs: Vec<Arc<Mutex<midir::MidiOutputConnection>>> = Vec::new();
+        for (page_idx, name) in port_names.iter().enumerate() {
+            let conn = open_or_virtual_output(
+                &format!("midi-pages-{}-page{}-out", cfg.name, page_idx + 1),
+                name,
+            )?;
+            outs.push(Arc::new(Mutex::new(conn)));
+        }
+        Arc::new(outs)
+    };
 
     let mut _host_inputs = Vec::new();
     for (page_idx, name) in port_names.iter().enumerate() {
@@ -978,7 +1096,13 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
     };
 
     let cb = make_cb();
-    connect_device_link(cfg, &proxy, &link, move |msg| cb(msg))?;
+    if let Err(e) = connect_device_link(cfg, &proxy, &link, move |msg| cb(msg)) {
+        warn!(
+            device = %cfg.name,
+            error = %e,
+            "physical device not reachable at startup; supervisor will keep retrying"
+        );
+    }
 
     spawn_supervisor(
         cfg.name.clone(),
