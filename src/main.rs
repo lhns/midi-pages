@@ -678,12 +678,20 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
     // thread is still alive. See the note in run_note_offset above for
     // why the implicit drop on function return doesn't fire (Arc cycle
     // through the plugin shim's captured `Arc<host_ports>`).
-    {
+    //
+    // Drop in parallel via thread::scope: WindowsHostPort::Drop spends
+    // ~500 ms in DisconnectEndpointConnection + MidiSession::Close, so
+    // sequential 7-page teardown overran the Win32 console handler's
+    // 2.5 s budget. Mirrors the parallel creation pattern above.
+    let ports_to_drop: Vec<ports::WindowsHostPort> = {
         let mut guard = host_ports.lock().unwrap();
-        for slot in guard.iter_mut() {
-            let _ = slot.take();
+        guard.iter_mut().filter_map(|slot| slot.take()).collect()
+    };
+    thread::scope(|s| {
+        for port in ports_to_drop {
+            s.spawn(move || drop(port));
         }
-    }
+    });
     Ok(())
 }
 
