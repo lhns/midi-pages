@@ -57,15 +57,12 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: .exe
-            archive: zip
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: ''
-            archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             ext: ''
-            archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -78,23 +75,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: cargo build --release
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package artifact
+      - name: Stage release files
         shell: bash
         run: |
           set -euo pipefail
-          NAME="midi-pages-${{ matrix.target }}"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/midi-pages${{ matrix.ext }}" "dist/midi-pages${{ matrix.ext }}"
           cp README.md LICENSE config.toml.example dist/
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd dist && 7z a "../${NAME}.zip" .)
-          else
-            tar -C dist -czf "${NAME}.tar.gz" .
-          fi
+      # Upload the loose staged files. actions/upload-artifact@v4 always
+      # wraps the artifact contents in a single zip on download from the
+      # workflow page, so pre-archiving here would double-zip. The release
+      # job below repackages into platform-native formats (.zip for
+      # Windows, .tar.gz for Linux/macOS) for tagged releases.
       - uses: actions/upload-artifact@v4
         with:
           name: midi-pages-${{ matrix.target }}
-          path: midi-pages-${{ matrix.target }}.*
+          path: dist/
 
   release:
     name: release
@@ -107,7 +103,21 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+      - name: Repackage per-platform release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          for dir in artifacts/midi-pages-*; do
+            target="$(basename "$dir")"
+            if [[ "$target" == *windows* ]]; then
+              (cd "$dir" && zip -r "${GITHUB_WORKSPACE}/release-assets/${target}.zip" .)
+            else
+              tar -C "$dir" -czf "release-assets/${target}.tar.gz" .
+            fi
+          done
+          ls -la release-assets/
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/midi-pages-*.*
+          files: release-assets/midi-pages-*.*
           generate_release_notes: true
