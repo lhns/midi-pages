@@ -83,7 +83,7 @@ pub fn open_output_named(client: &str, needle: &str) -> Result<midir::MidiOutput
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_host::WindowsHostPort;
+pub use windows_host::{PendingHostPort, WindowsHostPort, wait_for_ports};
 
 #[cfg(target_os = "windows")]
 mod windows_host {
@@ -146,11 +146,35 @@ mod windows_host {
         }
     }
 
-    impl WindowsHostPort {
-        /// Create a Virtual Device endpoint with the given external-facing
-        /// name and register `on_recv` to be called with byte-format MIDI 1.0
-        /// messages arriving from peers (the DAW).
-        pub fn create<F>(name: &str, on_recv: F) -> Result<Self>
+    /// A WMS Virtual Device whose registration has completed but whose
+    /// external WinMM visibility has not yet been confirmed. Produced by
+    /// `PendingHostPort::register` (which runs only the fast synchronous
+    /// WinRT phase); call `into_ready` after `wait_for_ports` has confirmed
+    /// the endpoint name is enumerable to get the final `WindowsHostPort`.
+    ///
+    /// Splitting registration from visibility-polling lets callers register
+    /// many endpoints in deterministic order on a single thread (so midisrv
+    /// assigns WinMM indices in that same order) and then wait for all of
+    /// them to become visible in one combined poll.
+    pub struct PendingHostPort {
+        connection: MidiEndpointConnection,
+        session: MidiSession,
+        device: MidiVirtualDevice,
+        plugin: IMidiEndpointMessageProcessingPlugin,
+        connection_id: GUID,
+        endpoint_name: String,
+    }
+
+    unsafe impl Send for PendingHostPort {}
+    unsafe impl Sync for PendingHostPort {}
+
+    impl PendingHostPort {
+        /// Run the synchronous WinRT registration phase only:
+        /// CreateVirtualDevice + MidiSession + connection.Open + plugin
+        /// wiring. Does NOT wait for the endpoint to appear in WinMM
+        /// enumeration — that's `wait_for_ports`'s job, which can be batched
+        /// across many pending ports.
+        pub fn register<F>(name: &str, on_recv: F) -> Result<Self>
         where
             F: Fn(&[u8]) + Send + Sync + 'static,
         {
@@ -230,22 +254,68 @@ mod windows_host {
                 .ConnectionId()
                 .map_err(|e| anyhow!("ConnectionId: {e}"))?;
 
-            // Wait for the externally-visible endpoint to appear in WinMM
-            // enumeration so downstream `find_*` calls would succeed; midisrv
-            // can be slow when several endpoints are created in succession.
-            wait_for_port(name, Duration::from_secs(20))?;
-
             Ok(Self {
-                sender: connection.clone(),
-                _connection: connection,
-                _session: session,
-                _device: device,
-                _plugin: plugin,
+                connection,
+                session,
+                device,
+                plugin,
                 connection_id,
                 endpoint_name: name.to_string(),
             })
         }
 
+        /// Convert a `PendingHostPort` whose WinMM visibility has already
+        /// been confirmed (via `wait_for_ports`) into a fully-ready
+        /// `WindowsHostPort`. Pure type-shuffle, no work.
+        pub fn into_ready(self) -> WindowsHostPort {
+            WindowsHostPort {
+                sender: self.connection.clone(),
+                _connection: self.connection,
+                _session: self.session,
+                _device: self.device,
+                _plugin: self.plugin,
+                connection_id: self.connection_id,
+                endpoint_name: self.endpoint_name,
+            }
+        }
+    }
+
+    /// Poll WinMM enumeration until every name in `names` is visible, or
+    /// `timeout` elapses. Uses one `MidiInput::new` per tick (cheap; just
+    /// enumerates, doesn't connect) and checks all names against that
+    /// snapshot. Returns an error listing the names that never appeared.
+    pub fn wait_for_ports(names: &[&str], timeout: Duration) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        let mut remaining: std::collections::HashSet<String> =
+            names.iter().map(|s| s.to_string()).collect();
+        loop {
+            let mi = MidiInput::new("midi-pages-probe-in")?;
+            let visible: std::collections::HashSet<String> = mi
+                .ports()
+                .iter()
+                .map(|p| mi.port_name(p).unwrap_or_default())
+                .collect();
+            remaining.retain(|n| !visible.contains(n));
+            if remaining.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let mut still_missing: Vec<String> = remaining.into_iter().collect();
+                still_missing.sort();
+                return Err(anyhow!(
+                    "WMS Virtual endpoints didn't appear in WinMM within {:?}: {:?}",
+                    timeout,
+                    still_missing
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    impl WindowsHostPort {
         /// Send byte-format MIDI 1.0 message(s) to peers. The input must be
         /// one complete message (NoteOn/Off/CC/SysEx/...); it's encoded as
         /// UMP and pushed to the connection word-by-word (one UMP packet
@@ -294,27 +364,6 @@ mod windows_host {
                 i += take;
             }
             Ok(())
-        }
-    }
-
-    fn wait_for_port(name: &str, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let mi = MidiInput::new("midi-pages-probe-in")?;
-            if mi
-                .ports()
-                .iter()
-                .any(|p| mi.port_name(p).unwrap_or_default() == name)
-            {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "WMS Virtual endpoint `{name}` didn't appear in WinMM within {:?}",
-                    timeout
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
 

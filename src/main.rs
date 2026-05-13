@@ -554,19 +554,23 @@ fn run_note_offset(
         .ok_or_else(|| anyhow!("note_offset mode requires host_port_in"))?;
 
     // Host side: ONE Virtual Device endpoint, plugin callback feeds the proxy.
+    // Two-phase: register (synchronous WinRT), wait for WinMM visibility,
+    // then install. With a single port there's no order question, but the
+    // shape stays consistent with run_per_port.
     let host_port: Arc<Mutex<Option<ports::WindowsHostPort>>> = Arc::new(Mutex::new(None));
     {
         let p_host = Arc::clone(&proxy);
         let host_port_for_cb = Arc::clone(&host_port);
         let link_for_cb = Arc::clone(&link);
-        let host_port_obj = ports::WindowsHostPort::create(host_name, move |msg| {
+        let pending = ports::PendingHostPort::register(host_name, move |msg| {
             let outs = {
                 let mut p = p_host.lock().unwrap();
                 p.handle_host_in(msg)
             };
             dispatch_offset_windows(&outs, &host_port_for_cb, &link_for_cb);
         })?;
-        *host_port.lock().unwrap() = Some(host_port_obj);
+        ports::wait_for_ports(&[host_name], Duration::from_secs(20))?;
+        *host_port.lock().unwrap() = Some(pending.into_ready());
     }
 
     // Device-side callback factory. Used both for the initial connect and
@@ -627,36 +631,39 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
     let host_ports: Arc<Mutex<Vec<Option<ports::WindowsHostPort>>>> =
         Arc::new(Mutex::new((0..pages as usize).map(|_| None).collect()));
 
-    // Create all page endpoints in parallel. Each `WindowsHostPort::create`
-    // spends ~5 s polling midisrv's WinMM bridge for the new endpoint to
-    // appear in enumeration; running them concurrently turns ~pages × 5 s
-    // into roughly max(per-port) instead of the sum.
-    thread::scope(|s| -> Result<()> {
-        let mut handles = Vec::with_capacity(port_names.len());
-        for (page_idx, host_name) in port_names.iter().enumerate() {
-            let p = Arc::clone(&proxy);
-            let host_ports_for_cb = Arc::clone(&host_ports);
-            let link_for_cb = Arc::clone(&link);
-            let host_ports_insert = Arc::clone(&host_ports);
-            let page = page_idx as u8;
-            handles.push(s.spawn(move || -> Result<()> {
-                let port = ports::WindowsHostPort::create(host_name, move |msg| {
-                    let outs = {
-                        let mut p = p.lock().unwrap();
-                        p.handle_host_in_per_port(page, msg)
-                    };
-                    dispatch_per_port_windows(&outs, &host_ports_for_cb, &link_for_cb);
-                })?;
-                host_ports_insert.lock().unwrap()[page_idx] = Some(port);
-                Ok(())
-            }));
+    // Two-phase creation. Phase 1 registers all per-page endpoints
+    // serially in page order on this thread — fast (~tens of ms each) and
+    // gives midisrv the CreateVirtualDevice calls back-to-back so the WinMM
+    // device-index assignments come out in page order (DasLight persists
+    // its MIDI bindings by index, so this stability matters across runs).
+    // Phase 2 then does a single combined wait until every registered
+    // endpoint is visible in WinMM enumeration; the per-port ~5 s
+    // visibility latency is shared, not serialized.
+    let mut pending: Vec<(usize, ports::PendingHostPort)> = Vec::with_capacity(port_names.len());
+    for (page_idx, host_name) in port_names.iter().enumerate() {
+        let p = Arc::clone(&proxy);
+        let host_ports_for_cb = Arc::clone(&host_ports);
+        let link_for_cb = Arc::clone(&link);
+        let page = page_idx as u8;
+        let pending_port = ports::PendingHostPort::register(host_name, move |msg| {
+            let outs = {
+                let mut p = p.lock().unwrap();
+                p.handle_host_in_per_port(page, msg)
+            };
+            dispatch_per_port_windows(&outs, &host_ports_for_cb, &link_for_cb);
+        })?;
+        pending.push((page_idx, pending_port));
+    }
+
+    let name_refs: Vec<&str> = port_names.iter().map(String::as_str).collect();
+    ports::wait_for_ports(&name_refs, Duration::from_secs(20))?;
+
+    {
+        let mut guard = host_ports.lock().unwrap();
+        for (page_idx, pending_port) in pending {
+            guard[page_idx] = Some(pending_port.into_ready());
         }
-        for h in handles {
-            h.join()
-                .map_err(|_| anyhow!("host port creation thread panicked"))??;
-        }
-        Ok(())
-    })?;
+    }
 
     // Device-side callback factory; rebuilt each reconnect by the supervisor.
     let make_cb = {
@@ -1011,27 +1018,34 @@ where
 #[cfg(target_os = "windows")]
 fn shutdown_smoke(cfg: &Config) -> Result<()> {
     info!("shutdown_smoke: opening all configured host ports");
-    let mut ports = Vec::new();
+    let mut all_names: Vec<String> = Vec::new();
+    let mut pending: Vec<ports::PendingHostPort> = Vec::new();
     for d in &cfg.devices {
         match d.mode {
             Mode::PerPort => {
                 for name in d.page_port_names() {
                     info!(port = %name, "open");
-                    ports.push(ports::WindowsHostPort::create(&name, |_| {})?);
+                    pending.push(ports::PendingHostPort::register(&name, |_| {})?);
+                    all_names.push(name);
                 }
             }
             Mode::NoteOffset => {
                 if let Some(name) = d.host_port_in.as_deref() {
                     info!(port = %name, "open");
-                    ports.push(ports::WindowsHostPort::create(name, |_| {})?);
+                    pending.push(ports::PendingHostPort::register(name, |_| {})?);
+                    all_names.push(name.to_string());
                 }
             }
         }
     }
-    info!(count = ports.len(), "opened; settling 500 ms");
+    let name_refs: Vec<&str> = all_names.iter().map(String::as_str).collect();
+    ports::wait_for_ports(&name_refs, Duration::from_secs(20))?;
+    let ports_ready: Vec<ports::WindowsHostPort> =
+        pending.into_iter().map(|p| p.into_ready()).collect();
+    info!(count = ports_ready.len(), "opened; settling 500 ms");
     thread::sleep(Duration::from_millis(500));
     info!("dropping all ports (exercises Drop chain)");
-    drop(ports);
+    drop(ports_ready);
     info!("dropped; waiting 500 ms for midisrv to settle");
     thread::sleep(Duration::from_millis(500));
     info!("shutdown_smoke complete; now run --list-ports to confirm no ghosts");
