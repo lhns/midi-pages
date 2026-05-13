@@ -10,6 +10,8 @@ Three navigation styles compose freely (see [ADR 0007](docs/adr/0007-configurabl
 - **Direct jump** — `page_buttons` (one per page) tap to jump to that page; their LEDs indicate the active page.
 - **Hold-to-preview** — `page_buttons` + `page_buttons_hold_to_preview = true`: hold a page button to interactively swap the grid to that page (pads pressed with another finger fire on the previewed page); release to revert. Persistent page is moved only via next/prev.
 
+Plus `global_buttons` for pads that always fire on page 0 regardless of the current page or preview (transport row, master mute, etc.); see [ADR 0014](docs/adr/0014-global-buttons.md).
+
 ## Modes
 
 There are two ways the proxy can present pages to the host. Pick one in `config.toml` per device.
@@ -50,14 +52,14 @@ A single virtual port pair; pages are encoded by adding `note_offset` to the not
 
 1. Install the [Windows MIDI Services SDK Runtime](https://aka.ms/MidiServicesLatestSdkRuntimeInstaller_Directx64) (or `winget install Microsoft.WindowsMIDIServicesSDK`). The runtime DLL alone (~3 MB at `C:\Program Files\Windows MIDI Services\Desktop App SDK Runtime\Microsoft.Windows.Devices.Midi2.dll`) is sufficient to run `midi-pages`. The full WMS Tools package (~180 MB) is optional and only useful for diagnostics (`midi.exe`, `MidiSettings.exe`).
 2. Plug in your Launchpad / APC mini.
-3. Copy `config.toml.example` to `config.toml` and adjust as needed. On Windows the Launchpad Mini MK3 enumerates as `LPMiniMK3 MIDI` (port 1, the DAW port) and `MIDIIN2/MIDIOUT2 (LPMiniMK3 MIDI)` (port 2, the MIDI port). Programmer-mode SysEx and pad I/O go through port 2 — set `port_match = "LPMiniMK3 MIDI)"` (note the closing paren) to disambiguate.
+3. Copy `config.toml.example` to `config.toml` and adjust as needed. On Windows the Launchpad Mini MK3 enumerates as `LPMiniMK3 MIDI` (port 1, the DAW port) and `MIDIIN2 (LPMiniMK3 MIDI)` / `MIDIOUT2 (LPMiniMK3 MIDI)` (port 2, the MIDI port). Programmer-mode SysEx and pad I/O go through port 2; set `port_match = "(LPMiniMK3 MIDI)"` (both parens) to select it. For devices whose input and output port names differ entirely, use the split form `port_match = { in = "...", out = "..." }`.
 4. `midi-pages.exe --config config.toml`. The proxy creates one WMS Virtual Device endpoint per page (named `<device-slug>-page<N>`) — see ADR 0012.
 5. Run `midi-pages --list-ports` if you want to verify what got created.
 6. In your DAW, select the per-page port as the MIDI device for both directions (input AND output). See the gotcha below.
 
 ## Configuration
 
-See `config.toml.example`. All page-navigation buttons are configurable per device (`kind = "note" | "cc"`, plus `number`); see [ADR 0007](docs/adr/0007-configurable-page-buttons.md) for the three usage modes.
+See `config.toml.example`. All page-navigation buttons are configurable per device (`kind = "note" | "cc"`, plus `number`); see [ADR 0007](docs/adr/0007-configurable-page-buttons.md) for the three usage modes. Pages are zero-indexed: a device with `pages = 4` has valid page numbers `0..=3`.
 
 ### DAW configuration: route everything through the proxy
 
@@ -65,9 +67,11 @@ For paging to work, the DAW must read **and write** to the per-page virtual port
 
 In DasLight specifically: in the MIDI controller editor, set both *input* and *output* to `<device-slug>-page1` (and the other `-pageN` ports for the other pages). Disable / unselect any of the real device names (`LPMiniMK3 MIDI`, `MIDIIN2 (LPMiniMK3 MIDI)`, `MIDIOUT2 (LPMiniMK3 MIDI)`).
 
-### Always shut down the proxy gracefully (Ctrl-C, not force-kill)
+### Force-kill is fine; Ctrl-C is still preferred
 
-The proxy installs a Ctrl-C handler that cleanly tears down its WMS Virtual Device endpoints. **Force-killing the process** (Task Manager → End Task, `Stop-Process -Force`, etc.) skips that cleanup and leaks Virtual Device registrations into `midisrv`. After a few force-kills, `midisrv` becomes wedged: enumeration hangs, new endpoints can't be created, and the only recovery is a system reboot (`Restart-Service midisrv` doesn't reliably clear the leak). Always exit with Ctrl-C in the terminal.
+Recent versions use a per-process `ProductInstanceId` (see ADR 0012) so each proxy run looks like a fresh device to midisrv. **Force-killing the process** (Task Manager → End Task, `Stop-Process -Force`, `taskkill /F`) no longer wedges midisrv — empirically `--list-ports` stays clean after a hard kill. Ctrl-C is still the gentler exit since it lets the Drop chain notify peers cleanly, but force-kill is a valid recovery option if the proxy stops responding.
+
+When the proxy was launched in the background and you can't Ctrl-C it directly, use `midi-pages --stop` (auto-discovers the running PID) or `midi-pages --stop <pid>`. The stop helper signals a named Win32 kernel event the proxy watches at startup (`Global\midi-pages-shutdown-<pid>` if the proxy had `SeCreateGlobalPrivilege`, otherwise `Local\...`), which then runs the same graceful shutdown path Ctrl-C uses. Auto-discovers the namespace; no flags needed. Windows-only.
 
 ## Building
 

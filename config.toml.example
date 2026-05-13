@@ -22,8 +22,9 @@
 #
 #   Mode A — sequential
 #       Configure `next_page_button` and/or `previous_page_button`.
-#       Walk pages with two physical buttons. Each press emits a brief
-#       (~200 ms) LED flash on the button as visual feedback.
+#       Walk pages with two physical buttons. The button is lit with the
+#       active color for as long as it is held, then returns to the
+#       inactive color on release.
 #
 #   Mode B — direct jump
 #       Configure `page_buttons` — one button per page. Tapping a button
@@ -39,12 +40,20 @@
 
 [[device]]
 name             = "Launchpad Mini MK3"
+# `port_match` is a substring matched against the OS-reported MIDI port
+# names. By default the same substring is used for both input and output.
+# For devices whose input and output ports have completely different
+# names, you can write a split form instead:
+#
+#   port_match = { in = "Weird IN", out = "Weird OUT" }
+#
 # On Windows the Mini MK3 enumerates as TWO ports: `LPMiniMK3 MIDI`
-# (port 1, the DAW port) and `MIDIIN2/MIDIOUT2 (LPMiniMK3 MIDI)` (port 2,
-# the MIDI port). Programmer-mode SysEx and pad I/O go through port 2 —
-# the closing paren disambiguates. On Linux/macOS the simpler
-# `"Launchpad Mini MK3"` substring works.
-port_match       = "LPMiniMK3 MIDI)"
+# (port 1, the DAW port) and `MIDIIN2 (LPMiniMK3 MIDI)` / `MIDIOUT2
+# (LPMiniMK3 MIDI)` (port 2, the MIDI port). Programmer-mode SysEx and
+# pad I/O go through port 2. The substring `(LPMiniMK3 MIDI)` (with both
+# parens) selects port 2 because port 1's name has no parens at all.
+# On Linux/macOS the simpler `"Launchpad Mini MK3"` substring works.
+port_match       = "(LPMiniMK3 MIDI)"
 driver           = "mini_mk3"
 mode             = "per_port"
 pages            = 4
@@ -56,9 +65,22 @@ next_page_button     = { kind = "cc", number = 91 }
 previous_page_button = { kind = "cc", number = 92 }
 
 # Mode B (optional): side-strip buttons act as both page indicators and
-# direct-jump targets. Slot index = page index (89 -> page 1, 79 -> page 2,
-# 69 -> page 3, 59 -> page 4). May be shorter than `pages` (those pages
-# just have no direct-jump button); cannot be longer.
+# direct-jump targets. Each entry's optional `page = N` field pins it to
+# a specific page; entries without `page` auto-assign in declaration
+# order to the lowest free page index. Each entry can also override
+# `hold_to_preview` for itself only, letting you mix tap and hold
+# buttons on the same device. May be shorter than `pages` (those high
+# pages are reachable only via next/previous_page_button); cannot be
+# longer.
+#
+# Pages are zero-indexed: with `pages = 4`, valid `page = N` values are
+# 0, 1, 2, 3.
+#
+# Auto-assignment walks declaration order: each unconstrained entry
+# claims the lowest free page index at that moment. An explicit
+# `page = N` later in the list is taken as written and may collide with
+# an earlier auto-assigned entry; both buttons then map to the same
+# page (allowed, intentional).
 page_buttons = [
   { kind = "cc", number = 89 },
   { kind = "cc", number = 79 },
@@ -66,10 +88,47 @@ page_buttons = [
   { kind = "cc", number = 59 },
 ]
 
+# Same, with per-entry overrides:
+# page_buttons = [
+#   { kind = "cc", number = 89, hold_to_preview = true },   # this button only previews
+#   { kind = "cc", number = 79 },                           # uses device default
+#   { kind = "cc", number = 69, page = 5 },                 # remap to page 5
+# ]
+
 # Mode C (default false): when true, page_buttons act as hold-to-preview
 # instead of direct jump. Persistent page is then moved only via
-# next/previous_page_button.
+# next/previous_page_button. Per-button `hold_to_preview` overrides this.
 # page_buttons_hold_to_preview = true
+
+# Optional per-device LED colors. Every field is optional. The in-code
+# fallbacks are deliberately minimal and device-agnostic: active=1 (lit on
+# essentially every controller) and inactive=0 (off). Set the block below
+# for the recommended Mini MK3 palette out of the box.
+#
+# Cascade:
+#   active           = tap page button on its persistent (active) page.
+#   inactive         = tap page button on any other page.
+#   preview          = page button while held in Mode C (defaults to active).
+#   active_cycle     = next/previous_page_button while held (defaults to active).
+#   inactive_cycle   = next/previous_page_button when idle (defaults to inactive).
+#   active_preview   = hold-to-preview page button on the persistent page,
+#                      when NOT held (defaults to active).
+#   inactive_preview = hold-to-preview page button on any other page,
+#                      when NOT held (defaults to inactive).
+#
+# Recommended Mini MK3 palette (21=green, 1=dim white, 13=yellow, 45=blue —
+# blue marks hold-mode page buttons so they're visually distinct from tap):
+colors = { active = 21, inactive = 1, preview = 13, active_preview = 45 }
+
+# Buttons pinned to page 0 in both directions: presses always fire on page 0
+# and host LED writes for them on page 0 always reach the device, regardless
+# of which page is currently visible or being previewed. Useful for a
+# transport row, master mute, etc. See ADR 0014.
+#
+# global_buttons = [
+#   { kind = "note", number = 11 },
+#   { kind = "note", number = 12 },
+# ]
 
 # In per_port mode the proxy auto-generates port names from `name`.
 # Override with an explicit prefix if you want shorter names:
@@ -82,9 +141,13 @@ driver           = "apc_mini"
 mode             = "per_port"
 pages            = 8
 # APC mini has no top-row arrow CCs; pick two grid corners or any unused
-# notes. Both fields are optional — Mode A only needs at least one of them.
+# notes. Both fields are optional, Mode A only needs at least one of them.
 next_page_button     = { kind = "note", number = 98 }
 previous_page_button = { kind = "note", number = 99 }
+
+# Recommended APC mini palette (override the universal active=1 / inactive=0
+# defaults with the documented APC velocity-as-color codes):
+# colors = { active = 1, inactive = 0, preview = 5, active_preview = 5 }
 
 # Example of note_offset mode (capped at 2 pages with default offset of 64):
 #
