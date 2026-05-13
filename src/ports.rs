@@ -123,6 +123,7 @@ mod windows_host {
         _plugin: IMidiEndpointMessageProcessingPlugin,
         sender: MidiEndpointConnection,
         connection_id: GUID,
+        endpoint_name: String,
     }
 
     unsafe impl Send for WindowsHostPort {}
@@ -137,6 +138,7 @@ mod windows_host {
             // owned connections; the per-PID ProductInstanceId in `create`
             // ensures recreations after this don't get blocked by midisrv's
             // WinMM-bridge cache. Errors are ignored — best-effort in Drop.
+            tracing::info!(name = %self.endpoint_name, "WMS Virtual Device dropped");
             let _ = self
                 ._session
                 .DisconnectEndpointConnection(self.connection_id);
@@ -240,6 +242,7 @@ mod windows_host {
                 _device: device,
                 _plugin: plugin,
                 connection_id,
+                endpoint_name: name.to_string(),
             })
         }
 

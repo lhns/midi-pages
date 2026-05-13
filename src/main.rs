@@ -108,7 +108,10 @@ struct Args {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     // Set a panic hook that flags shutdown and gives worker threads a moment
@@ -119,7 +122,12 @@ fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
         SHUTDOWN.store(true, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(1_000));
+        // Same window the Win32 console handler uses, so a panicking worker
+        // thread gets to run host-port Drop chains (DisconnectEndpointConnection
+        // + Session::Close) before the process exits — otherwise midisrv keeps
+        // the Virtual Device registrations alive for the dead PID and the next
+        // run hangs on CreateVirtualDevice.
+        std::thread::sleep(Duration::from_millis(2_500));
     }));
 
     let args = Args::parse();
@@ -260,7 +268,11 @@ fn wait_for_shutdown() {
 /// change) so steady-state runs are silent. Exits when `SHUTDOWN` flips.
 ///
 /// The thread handle is dropped: the watchdog dies on its own via the
-/// SHUTDOWN check on the next `park_timeout` wake-up (within ~1s).
+/// SHUTDOWN check on the next `park_timeout` wake-up (within ~5s).
+///
+/// Polls at 5s rather than 1s — the supervisor's own 1s presence check
+/// drives reconnect latency; this watchdog only adds standalone
+/// diagnostics, so a slower cadence keeps midisrv enumeration traffic low.
 fn spawn_presence_watchdog(device_name: String, needle: String) {
     let _ = thread::Builder::new()
         .name(format!("midi-pages:{device_name}:presence"))
@@ -302,7 +314,7 @@ fn spawn_presence_watchdog(device_name: String, needle: String) {
                         );
                     }
                 }
-                thread::park_timeout(Duration::from_secs(1));
+                thread::park_timeout(Duration::from_secs(5));
             }
         });
 }
@@ -569,6 +581,15 @@ fn run_note_offset(
 
     info!(device = %cfg.name, mode = "note_offset", "running. Ctrl-C to exit.");
     wait_for_shutdown();
+
+    // Force WindowsHostPort::Drop to run while this thread is still alive.
+    // The plugin shim's input-callback closure captures `Arc<host_port>`,
+    // forming a reference cycle that keeps the WindowsHostPort alive past
+    // process exit — Drop never fires, midisrv keeps the Virtual Device
+    // registration for this dead PID, and the next run hangs on
+    // CreateVirtualDevice. Taking the Option here releases the value (and
+    // therefore the WMS resources) synchronously.
+    let _dropped = host_port.lock().unwrap().take();
     Ok(())
 }
 
@@ -652,6 +673,17 @@ fn run_per_port(cfg: &DeviceConfig, proxy: Arc<Mutex<Proxy>>, link: Arc<DeviceLi
         "running. Ctrl-C to exit."
     );
     wait_for_shutdown();
+
+    // Force WindowsHostPort::Drop on each per-page endpoint while this
+    // thread is still alive. See the note in run_note_offset above for
+    // why the implicit drop on function return doesn't fire (Arc cycle
+    // through the plugin shim's captured `Arc<host_ports>`).
+    {
+        let mut guard = host_ports.lock().unwrap();
+        for slot in guard.iter_mut() {
+            let _ = slot.take();
+        }
+    }
     Ok(())
 }
 
