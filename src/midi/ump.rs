@@ -63,10 +63,10 @@ fn encode_sysex(bytes: &[u8], group: u8) -> Vec<u32> {
     }
     for (i, chunk) in chunks.iter().enumerate() {
         let status = match (total, i) {
-            (1, 0) => 0x0,       // single complete
-            (_, 0) => 0x1,       // start
+            (1, 0) => 0x0,                         // single complete
+            (_, 0) => 0x1,                         // start
             (_, last) if last == total - 1 => 0x3, // end
-            _ => 0x2,            // continue
+            _ => 0x2,                              // continue
         };
         words.extend_from_slice(&mt3_packet(group, status, chunk));
     }
@@ -317,10 +317,10 @@ mod tests {
         // are arbitrary timestamp/clock payload. The decoder must consume each
         // word silently — emitting nothing.
         let words = [
-            0x00000000_u32, // NOOP
-            0x00112233,     // NOOP with junk in data field
-            0x00100000 | 0x1234,    // JR Clock
-            0x00200000 | 0xFFFFF,   // JR Timestamp (max value)
+            0x00000000_u32,       // NOOP
+            0x00112233,           // NOOP with junk in data field
+            0x00100000 | 0x1234,  // JR Clock
+            0x00200000 | 0xFFFFF, // JR Timestamp (max value)
         ];
         assert!(Decoder::new().feed(&words).is_empty());
     }
@@ -339,9 +339,9 @@ mod tests {
         let stream = [
             0xF0001234_u32, // word 0: MT 0xF, Format 00 (single), status, data
             0x20904160,     // word 1 — pre-fix would have decoded this as a
-                            // channel-voice NoteOn note 0x41 vel 0x60.
-            0x29904271,     // word 2 — top nibble 0x2, status bits 0x90 etc.
-            0x00DEADBE,     // word 3 — looks like MT0 if mis-read
+            // channel-voice NoteOn note 0x41 vel 0x60.
+            0x29904271, // word 2 — top nibble 0x2, status bits 0x90 etc.
+            0x00DEADBE, // word 3 — looks like MT0 if mis-read
         ];
         let note_on = encode(&[0x90, 60, 100], 0);
         let mut feed_buf = Vec::from(&stream[..]);

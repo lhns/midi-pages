@@ -6,7 +6,9 @@ use std::time::Duration;
 use midir::MidiInput;
 
 fn main() {
-    let needle = std::env::args().nth(1).expect("usage: listen_port <port-substring>");
+    let needle = std::env::args()
+        .nth(1)
+        .expect("usage: listen_port <port-substring>");
     let mi = MidiInput::new("listen_port-in").expect("MidiInput");
     let port = mi
         .ports()

@@ -144,11 +144,7 @@ mod windows_host {
             // the WinMM API) saw no device. Including the PID makes each run
             // a brand-new device from midisrv's point of view; the friendly
             // Name stays stable so DasLight bindings still match.
-            let product_id = format!(
-                "midi-pages.{}.{}",
-                unique_id_for(name),
-                std::process::id()
-            );
+            let product_id = format!("midi-pages.{}.{}", unique_id_for(name), std::process::id());
             let info = MidiDeclaredEndpointInfo {
                 Name: HSTRING::from(name),
                 ProductInstanceId: HSTRING::from(product_id.as_str()),
@@ -187,8 +183,7 @@ mod windows_host {
                 .map_err(|e| anyhow!("CreateEndpointConnection: {e}"))?;
 
             let plugin_id = GUID::from_u128(
-                0xb1d10001_0000_4000_8000_000000000000
-                    ^ u128::from(fnv1a64(name.as_bytes())),
+                0xb1d10001_0000_4000_8000_000000000000 ^ u128::from(fnv1a64(name.as_bytes())),
             );
             let plugin_obj = PluginShim {
                 plugin_id,

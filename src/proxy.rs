@@ -111,8 +111,7 @@ impl Proxy {
             && cfg.previous_page_button.is_none()
             && (cfg.page_buttons.len() as u8) < cfg.pages
         {
-            let unreachable: Vec<u8> =
-                ((cfg.page_buttons.len() as u8)..cfg.pages).collect();
+            let unreachable: Vec<u8> = ((cfg.page_buttons.len() as u8)..cfg.pages).collect();
             tracing::warn!(
                 device = %cfg.name,
                 unreachable_pages = ?unreachable,
@@ -164,7 +163,11 @@ impl Proxy {
                 let color = if Some(pb.page) == self.held_preview {
                     self.preview_color
                 } else if pb.page == self.persistent_page {
-                    if pb.hold { self.active_preview } else { self.active_color }
+                    if pb.hold {
+                        self.active_preview
+                    } else {
+                        self.active_color
+                    }
                 } else if pb.hold {
                     self.inactive_preview
                 } else {
@@ -325,7 +328,10 @@ impl Proxy {
     }
 
     fn page_button(&self, btn: ButtonRef) -> Option<ResolvedPageButton> {
-        self.page_buttons.iter().copied().find(|pb| pb.button == btn)
+        self.page_buttons
+            .iter()
+            .copied()
+            .find(|pb| pb.button == btn)
     }
 
     fn handle_next_press(&mut self, btn: ButtonRef) -> Vec<Out> {
@@ -485,8 +491,10 @@ impl Proxy {
             let target_page = led.led_index / self.note_offset;
             let physical = led.led_index % self.note_offset;
             if (target_page as usize) < self.led_cache.len() {
-                self.led_cache[target_page as usize]
-                    .insert(CacheKey::Note(physical), LedCell::SysexColor(led.color.clone()));
+                self.led_cache[target_page as usize].insert(
+                    CacheKey::Note(physical),
+                    LedCell::SysexColor(led.color.clone()),
+                );
             }
             if target_page == self.current_page {
                 on_page.push(LedSpec {
@@ -523,11 +531,19 @@ impl Proxy {
         if let Some(btn) = self.global_button_addressed(bytes) {
             let key = cache_key_for(btn);
             match parse::classify(bytes) {
-                Msg::NoteOn { channel, velocity, .. } => {
+                Msg::NoteOn {
+                    channel, velocity, ..
+                } => {
                     self.led_cache[0].insert(key, LedCell::NoteOn { channel, velocity });
                 }
                 Msg::NoteOff { channel, .. } => {
-                    self.led_cache[0].insert(key, LedCell::NoteOn { channel, velocity: 0 });
+                    self.led_cache[0].insert(
+                        key,
+                        LedCell::NoteOn {
+                            channel,
+                            velocity: 0,
+                        },
+                    );
                 }
                 Msg::Cc { channel, value, .. } => {
                     self.led_cache[0].insert(key, LedCell::Cc { channel, value });
@@ -866,7 +882,11 @@ mod tests {
     use crate::config::{ColorConfig, PageButton, PortMatch};
 
     fn pb(b: ButtonRef) -> PageButton {
-        PageButton { button: b, page: None, hold_to_preview: None }
+        PageButton {
+            button: b,
+            page: None,
+            hold_to_preview: None,
+        }
     }
     use crate::midi::apc_mini::ApcMini;
     use crate::midi::mini_mk3::MiniMk3;
@@ -1266,7 +1286,10 @@ mod tests {
     #[test]
     fn perport_page_change_paints_page_button_indicators() {
         let mut cfg = cfg_mini(2, Mode::PerPort);
-        cfg.page_buttons = vec![pb(ButtonRef::Cc { number: 89 }), pb(ButtonRef::Cc { number: 79 })];
+        cfg.page_buttons = vec![
+            pb(ButtonRef::Cc { number: 89 }),
+            pb(ButtonRef::Cc { number: 79 }),
+        ];
         let mut p = Proxy::new(&cfg, Box::new(MiniMk3));
         // Use set_persistent_page (not raw change_page_to) so persistent_page
         // and the indicator paint agree.
@@ -1718,7 +1741,10 @@ mod tests {
         // Cached at page 0.
         assert_eq!(
             p.led_cache[0].get(&CacheKey::Note(0)),
-            Some(&LedCell::NoteOn { channel: 0, velocity: 1 })
+            Some(&LedCell::NoteOn {
+                channel: 0,
+                velocity: 1
+            })
         );
         // Also: host writes for the same global on a "wrong" page port still
         // cache at page 0 and forward.
@@ -1726,7 +1752,10 @@ mod tests {
         assert_eq!(device_bytes(&out), vec![parse::note_on(0, 0, 3).to_vec()]);
         assert_eq!(
             p.led_cache[0].get(&CacheKey::Note(0)),
-            Some(&LedCell::NoteOn { channel: 0, velocity: 3 })
+            Some(&LedCell::NoteOn {
+                channel: 0,
+                velocity: 3
+            })
         );
     }
 

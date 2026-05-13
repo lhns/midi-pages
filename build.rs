@@ -14,7 +14,10 @@ fn main() {
 fn generate_wms_bindings() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let wms_winmd = format!("{manifest_dir}/vendor/wms/Microsoft.Windows.Devices.Midi2.winmd");
-    assert!(std::path::Path::new(&wms_winmd).exists(), "missing {wms_winmd}");
+    assert!(
+        std::path::Path::new(&wms_winmd).exists(),
+        "missing {wms_winmd}"
+    );
 
     // The standard Windows.winmd ships with the Windows SDK; we look it up via
     // the Windows Kits install to satisfy references to Windows.Foundation.* etc.

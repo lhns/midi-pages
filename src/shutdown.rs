@@ -124,14 +124,18 @@ fn create_event_with_null_dacl(name: &str) -> Option<EventHandle> {
     let name_w = wide(name);
     let mut sd_buf = [0u8; SECURITY_DESCRIPTOR_BUF_SIZE];
     unsafe {
-        if InitializeSecurityDescriptor(sd_buf.as_mut_ptr() as *mut c_void, SECURITY_DESCRIPTOR_REVISION) == 0 {
+        if InitializeSecurityDescriptor(
+            sd_buf.as_mut_ptr() as *mut c_void,
+            SECURITY_DESCRIPTOR_REVISION,
+        ) == 0
+        {
             return None;
         }
         if SetSecurityDescriptorDacl(
             sd_buf.as_mut_ptr() as *mut c_void,
-            1, // bDaclPresent = TRUE
+            1,                    // bDaclPresent = TRUE
             std::ptr::null_mut(), // pDacl = NULL  =>  no DACL  =>  unrestricted
-            0, // bDaclDefaulted = FALSE
+            0,                    // bDaclDefaulted = FALSE
         ) == 0
         {
             return None;
@@ -195,15 +199,21 @@ pub fn signal_event(handle: EventHandle) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
     #[test]
     fn event_name_format_for_pid() {
-        assert_eq!(event_name(Namespace::Global, 1234), "Global\\midi-pages-shutdown-1234");
-        assert_eq!(event_name(Namespace::Local, 1234), "Local\\midi-pages-shutdown-1234");
+        assert_eq!(
+            event_name(Namespace::Global, 1234),
+            "Global\\midi-pages-shutdown-1234"
+        );
+        assert_eq!(
+            event_name(Namespace::Local, 1234),
+            "Local\\midi-pages-shutdown-1234"
+        );
     }
 
     #[test]
@@ -233,9 +243,14 @@ mod tests {
         signal_event(open_handle).expect("signal_event");
 
         waiter.join().expect("waiter thread");
-        assert!(signalled.load(Ordering::SeqCst), "watcher never saw the signal");
+        assert!(
+            signalled.load(Ordering::SeqCst),
+            "watcher never saw the signal"
+        );
 
-        unsafe { CloseHandle(created.handle); }
+        unsafe {
+            CloseHandle(created.handle);
+        }
     }
 
     #[test]
@@ -246,7 +261,12 @@ mod tests {
         // real PID).
         let fake_pid = std::process::id().wrapping_add(987_654);
         let created = create_shutdown_event(fake_pid).expect("must create somewhere");
-        assert!(matches!(created.namespace, Namespace::Global | Namespace::Local));
-        unsafe { CloseHandle(created.handle); }
+        assert!(matches!(
+            created.namespace,
+            Namespace::Global | Namespace::Local
+        ));
+        unsafe {
+            CloseHandle(created.handle);
+        }
     }
 }

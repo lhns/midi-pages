@@ -142,7 +142,9 @@ fn install_shutdown_handler(threads: Vec<thread::Thread>) {
         info!("shutdown signal received");
         trigger_shutdown(&threads);
     }) {
-        warn!("failed to install signal handler: {e}. Force-killing this process may leak resources.");
+        warn!(
+            "failed to install signal handler: {e}. Force-killing this process may leak resources."
+        );
     }
 }
 
@@ -344,7 +346,8 @@ fn run_per_port(
             }));
         }
         for h in handles {
-            h.join().map_err(|_| anyhow!("host port creation thread panicked"))??;
+            h.join()
+                .map_err(|_| anyhow!("host port creation thread panicked"))??;
         }
         Ok(())
     })?;
@@ -787,8 +790,7 @@ fn install_shutdown_event_watcher() {
     let _ = thread::Builder::new()
         .name("midi-pages-shutdown-event".into())
         .spawn(move || {
-            let rc =
-                unsafe { shutdown::WaitForSingleObject(handle, shutdown::INFINITE) };
+            let rc = unsafe { shutdown::WaitForSingleObject(handle, shutdown::INFINITE) };
             if rc == shutdown::WAIT_OBJECT_0 {
                 info!("shutdown event signalled");
                 if let Some(threads) = THREADS.get() {

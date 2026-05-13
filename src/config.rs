@@ -190,7 +190,9 @@ impl DeviceConfig {
     /// Each name is one MIDI endpoint visible to the DAW.
     pub fn page_port_names(&self) -> Vec<String> {
         let prefix = self.effective_prefix();
-        (1..=self.pages).map(|i| format!("{prefix}-page{i}")).collect()
+        (1..=self.pages)
+            .map(|i| format!("{prefix}-page{i}"))
+            .collect()
     }
 
     pub fn note_offset_value(&self) -> u8 {
@@ -266,7 +268,6 @@ impl ButtonRef {
             ButtonRef::Note { number } | ButtonRef::Cc { number } => number,
         }
     }
-
 }
 
 /// A page-button entry from `[[device]].page_buttons`. Wraps a
@@ -373,8 +374,7 @@ impl Config {
                         )));
                     }
                 }
-                if Some(a.button) == d.next_page_button
-                    || Some(a.button) == d.previous_page_button
+                if Some(a.button) == d.next_page_button || Some(a.button) == d.previous_page_button
                 {
                     return Err(ConfigError::Invalid(format!(
                         "{}: page_buttons collides with next/previous_page_button",
@@ -475,10 +475,7 @@ impl Config {
                     }
                     // WinMM caps MIDI device names at 31 chars (MIDIINCAPSW.szPname[32]).
                     // Anything longer gets truncated and becomes unfindable on Windows.
-                    if let Some(longest) = d
-                        .page_port_names()
-                        .into_iter()
-                        .max_by_key(|s| s.len())
+                    if let Some(longest) = d.page_port_names().into_iter().max_by_key(|s| s.len())
                         && longest.len() > 31
                     {
                         return Err(ConfigError::Invalid(format!(
@@ -612,7 +609,9 @@ pages       = 1
 "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("duplicate input"), "{s}");
     }
 
@@ -632,12 +631,15 @@ pages       = 1
         assert_eq!(cfg.devices[0].pages, 4);
 
         let names = cfg.devices[0].page_port_names();
-        assert_eq!(names, vec![
-            "launchpad-mini-mk3-page1",
-            "launchpad-mini-mk3-page2",
-            "launchpad-mini-mk3-page3",
-            "launchpad-mini-mk3-page4",
-        ]);
+        assert_eq!(
+            names,
+            vec![
+                "launchpad-mini-mk3-page1",
+                "launchpad-mini-mk3-page2",
+                "launchpad-mini-mk3-page3",
+                "launchpad-mini-mk3-page4",
+            ]
+        );
     }
 
     #[test]
@@ -696,7 +698,9 @@ pages       = 1
             .replace("host_port_out        = \"host-out\"\n", "");
         let cfg: Config = toml::from_str(&bad).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("host_port_in"), "{s}");
     }
 
@@ -713,7 +717,9 @@ pages       = 1
         let bad = VALID_PER_PORT.to_string() + "page_buttons_hold_to_preview = true\n";
         let cfg: Config = toml::from_str(&bad).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("page_buttons_hold_to_preview"), "{s}");
     }
 
@@ -728,7 +734,9 @@ pages       = 4
 "#;
         let cfg: Config = toml::from_str(bad).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("pages > 1 requires"), "{s}");
     }
 
@@ -901,7 +909,9 @@ global_buttons = [
 "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("duplicate global_buttons"), "{s}");
     }
 
@@ -919,7 +929,9 @@ global_buttons = [ { kind = "note", number = 11 } ]
 "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("collides with a page_buttons"), "{s}");
     }
 
@@ -940,7 +952,9 @@ global_buttons = [ { kind = "note", number = 40 } ]
 "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("globals must live in page 0"), "{s}");
     }
 
@@ -956,7 +970,9 @@ global_buttons = [ { kind = "note", number = 40 } ]
             ]\n";
         let cfg: Config = toml::from_str(&bad).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("entries but pages"), "{s}");
     }
 
@@ -1061,7 +1077,9 @@ page_buttons = [
 "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("pin to page = 2"), "{s}");
     }
 
@@ -1080,7 +1098,9 @@ page_buttons = [
 "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let err = cfg.validate().unwrap_err();
-        let ConfigError::Invalid(s) = err else { panic!("wrong err type") };
+        let ConfigError::Invalid(s) = err else {
+            panic!("wrong err type")
+        };
         assert!(s.contains("page = 5"), "{s}");
     }
 
@@ -1102,8 +1122,14 @@ page_buttons = [
         let cfg: Config = toml::from_str(src).unwrap();
         cfg.validate().unwrap();
         let resolved = cfg.devices[0].resolved_page_buttons();
-        assert!(!resolved[0].hold, "explicit per-button false overrides global true");
-        assert!(resolved[1].hold, "missing per-button defaults to global true");
+        assert!(
+            !resolved[0].hold,
+            "explicit per-button false overrides global true"
+        );
+        assert!(
+            resolved[1].hold,
+            "missing per-button defaults to global true"
+        );
     }
 
     #[test]
